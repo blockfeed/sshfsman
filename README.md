@@ -1,201 +1,223 @@
 # sshfsman
 
-CLI wrapper around `sshfs`/FUSE that mounts remotes under:
+A deterministic CLI for managing `sshfs` mounts under a single mount root (default: `/mnt/sshfs`).
 
-- `/mnt/sshfs/<id>` (default)
+Config lives at:
 
-It is intentionally CLI-first and auditable. I really love **sftpman**, but I wanted a tiny tool
-that is:
+- `~/.config/sshfsman/config.toml`
 
-- straightforward to script
-- friendly to devices whose IP changes often (e.g. Android phones using MAC privacy/randomization)
-- able to mount by "shortcut name + last IP octet"
+## Ground truth mount detection (single source)
 
-## Features
+A path is considered mounted **only** if:
 
-- `mount`, `unmount`, `status`
-- safe mountpoint creation on mount
-- safe mountpoint pruning on unmount (only if unmounted + empty)
-- XDG config: `~/.config/sshfsman/config.toml` (or `$XDG_CONFIG_HOME/...`)
-- shortcuts with default subnet expansion
-- shortcut management:
-  - `list-shortcuts`
-  - `create-shortcut`
-  - `delete-shortcut`
-  - `mount ... --create-shortcut NAME` (create/clobber on successful mount)
-- bulk ops:
-  - `list-mounted`
-  - `unmount-all`
-  - `debug-config`
+- `findmnt -T <path>` reports `FSTYPE` exactly `fuse.sshfs`
 
-## Install
+This is the only mount detection used by:
 
-### Option A: pipx (recommended)
+- mount guard
+- unmount
+- unmount-all
+- list-mounts
+- status
+
+No directory-exists checks. No `mountpoint -q`. No `/proc/mounts` scraping.
+
+## Requirements
+
+- Linux
+- `sshfs` + `fuse3`
+- `findmnt` (util-linux)
+
+## Install (repo)
 
 ```bash
-pipx install git+https://github.com/<you>/sshfsman.git
-sshfsman --help
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip
+pip install -e .
 ```
 
-### Option B: run from a git checkout
+Run via wrapper:
 
 ```bash
 ./sshfsman.py --help
 ```
 
-## Requirements
+## Shortcut invocation is saved (port, options, identity)
 
-- `sshfs`
-- `fuse3` (provides `fusermount3` on most distros)
-- optional: `sshpass` (only for non-interactive password auth)
+When you create a shortcut via `mount --create-shortcut NAME` or `create-shortcut`, sshfsman saves the mount invocation parameters into the shortcut:
 
-## Configuration (XDG)
+- `port`
+- `identity`
+- `options` (sshfs `-o` values)
+- `readonly`
+- `no_reconnect_defaults`
 
-Config is loaded from:
+When you later run `sshfsman mount --shortcut NAME ...`, those saved parameters are applied automatically. CLI flags override saved values.
 
-1. `$XDG_CONFIG_HOME/sshfsman/config.toml`
-2. `~/.config/sshfsman/config.toml`
+## Config
 
-Start from the example:
-
-```bash
-mkdir -p ~/.config/sshfsman
-cp config.example.toml ~/.config/sshfsman/config.toml
-```
-
-Example (`config.toml`):
+Example `~/.config/sshfsman/config.toml`:
 
 ```toml
-[defaults]
+[config]
 mount_root = "/mnt/sshfs"
-default_port = 22
-default_subnet = "10.0.20"
-default_user = "user"
+default_subnet = "192.0.2"
 
-[shortcuts.my-phone]
-id = "my-phone"
-remote_path = "/home/user/files"
+[shortcuts]
+
+[shortcuts."phone"]
+id = "phone"
+remote = "user@192.0.2.10:/path"
+mount_dir = "phone"
 port = 2222
-prefer_password = true
-# disable_pubkey = true
-# insecure_hostkey = true
+identity = "/home/user/.ssh/id_ed25519"
+options = [
+  "allow_other",
+]
+readonly = false
+no_reconnect_defaults = false
 ```
 
-## Usage
+## Commands
 
-### Simple mount
+### mount
+
+Mount by remote and create or overwrite a shortcut named `phone` (port saved):
 
 ```bash
-sshfsman mount --id phone --remote user@192.0.2.10:/sdcard
+sshfsman mount --remote user@192.0.2.10:/path --port 2222 --create-shortcut phone
 ```
 
-### Password auth
-
-Interactive prompt:
+Mount using that shortcut (port reused automatically), overriding the last octet:
 
 ```bash
-sshfsman mount --id phone --remote user@192.0.2.10:/sdcard --password
+sshfsman mount --shortcut phone 138
 ```
 
-Non-interactive (requires `sshpass`):
+Rules:
+
+- `--create-shortcut NAME` does **not** require `--id`.
+- It always sets `id = NAME`.
+- It overwrites an existing shortcut with the same name.
+- Mounting is **not** blocked by an existing directory; only an actual `fuse.sshfs` mount blocks mounting.
+
+Useful options:
 
 ```bash
-SSHFSMAN_PASSWORD='...' sshfsman mount --id phone --remote user@192.0.2.10:/sdcard --password --non-interactive
+sshfsman mount --remote user@192.0.2.10:/path --mount-dir phone --readonly
+sshfsman mount --remote user@192.0.2.10:/path -p 2222 -i ~/.ssh/id_ed25519
+sshfsman mount --remote user@192.0.2.10:/path -o allow_other -o Compression=no
 ```
 
-### Shortcuts (dynamic IP by last octet)
+### list-mounts
 
-Mount using a shortcut name + last octet in `defaults.default_subnet`:
+List current `fuse.sshfs` mounts under `mount_root`:
 
 ```bash
-sshfsman mount --shortcut my-phone 138
+sshfsman list-mounts
 ```
 
-Unmount using a shortcut:
+List all system `fuse.sshfs` mounts:
 
 ```bash
-sshfsman unmount --shortcut my-phone
+sshfsman list-mounts --all
 ```
 
-List shortcuts:
+Emit JSON:
 
 ```bash
-sshfsman list-shortcuts
+sshfsman list-mounts --json
 ```
 
-### Create a shortcut from a successful mount
+### unmount
 
-This does **not** require `--id`. If omitted, `id` defaults to the shortcut name.
+Unmount by path:
 
 ```bash
-sshfsman mount \
-  --remote user@192.0.2.10:/home/user/files \
-  --port 2222 \
-  --create-shortcut my-phone
+sshfsman unmount --path /mnt/sshfs/phone
 ```
 
-Later, mount it at a different host in the configured subnet:
+Or by shortcut name:
 
 ```bash
-sshfsman mount --shortcut my-phone 138
+sshfsman unmount --shortcut phone
 ```
 
-### Explicitly manage shortcuts
+Safety:
 
-Create/update:
+- Post-unmount cleanup only removes **empty** directories under `mount_root`.
+- No recursive delete.
 
-```bash
-sshfsman create-shortcut my-phone \
-  --id my-phone \
-  --remote-path /home/user/files \
-  --port 2222 \
-  --prefer-password
-```
+### unmount-all
 
-Delete:
-
-```bash
-sshfsman delete-shortcut my-phone
-```
-
-### Set defaults.default_subnet
-
-```bash
-sshfsman set-default-subnet 10.0.20
-```
-
-### List mounted sshfs under mount_root
-
-```bash
-sshfsman list-mounted
-```
-
-List all sshfs mounts (ignore mount_root):
-
-```bash
-sshfsman list-mounted --all
-```
-
-### Unmount all sshfs under mount_root
+Unmount everything under `mount_root`:
 
 ```bash
 sshfsman unmount-all
 ```
 
-### Debug config + mount visibility
+Also unmount `fuse.sshfs` mounts outside `mount_root`:
+
+```bash
+sshfsman unmount-all --all
+```
+
+### status
+
+Check a single shortcut:
+
+```bash
+sshfsman status --shortcut phone
+```
+
+Check a path:
+
+```bash
+sshfsman status --path /mnt/sshfs/phone
+```
+
+List all shortcuts with status:
+
+```bash
+sshfsman status
+```
+
+### list-shortcuts
+
+```bash
+sshfsman list-shortcuts
+sshfsman list-shortcuts --json
+```
+
+### create-shortcut
+
+Create or overwrite a shortcut explicitly (including port/options):
+
+```bash
+sshfsman create-shortcut phone --remote user@192.0.2.10:/path --port 2222 -o allow_other
+```
+
+### delete-shortcut
+
+```bash
+sshfsman delete-shortcut phone
+```
+
+### set-default-subnet
+
+```bash
+sshfsman set-default-subnet 192.0.2
+```
+
+### debug-config
+
+Print resolved config and mount diagnostics under `mount_root`:
 
 ```bash
 sshfsman debug-config
 ```
 
-## Safety model
-
-- Never deletes remote content (sshfs client-side only)
-- Pruning uses `rmdir()` only and only when:
-  - the mount is gone
-  - the directory is empty
-  - the path is inside `mount_root`
-
 ## License
 
-GPL-3.0-only. See `LICENSE`.
+GPL-3.0-only
