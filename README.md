@@ -292,6 +292,17 @@ I like `sshfs`. I just don’t like babysitting it.
 
 ---
 
+## Relationship to sftpman
+
+If you’ve used **sftpman**, this should feel familiar.
+
+`sshfsman` is the same idea applied to `sshfs` mounts instead of interactive SFTP sessions:
+shortcuts, saved connection details, predictable behavior, and a refusal to guess or be clever.
+
+`sftpman` made jumping into remote filesystems painless.
+`sshfsman` exists because I wanted the *mounted* version of that workflow, with the same philosophy.
+
+
 ## License
 
 GPL-3.0-only
