@@ -250,31 +250,79 @@ def list_mounted_under(mount_root: Path) -> list[dict[str, str]]:
 
     Each entry: {mountpoint, source, fstype}
     """
-    out: list[dict[str, str]] = []
-    mr = realpath_strict(mount_root)
-    try:
-        text = Path("/proc/mounts").read_text(encoding="utf-8")
-    except Exception:
+    # Prefer findmnt if present: it understands mount namespaces and is robust.
+    if shutil_which("findmnt"):
+        try:
+            # -r no headings, -n raw, -t type, -o columns
+            r = run(["findmnt", "-rn", "-t", "fuse.sshfs", "-o", "TARGET,SOURCE,FSTYPE"], check=False)
+            text = (r.stdout or "").strip("\n")
+        except Exception:
+            text = ""
+        out: list[dict[str, str]] = []
+        mr = realpath_strict(mount_root)
+        for line in text.splitlines():
+            # TARGET SOURCE FSTYPE (space-separated; SOURCE can include spaces rarely, but sshfs sources won't)
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mp, src, fstype = parts[0], parts[1], parts[2]
+            try:
+                realpath_strict(Path(mp)).relative_to(mr)
+            except Exception:
+                continue
+            out.append({"mountpoint": mp, "source": src, "fstype": fstype})
+        out.sort(key=lambda d: d["mountpoint"])
         return out
 
-    for line in text.splitlines():
+    # Fallback: parse /proc/mounts
+    out2: list[dict[str, str]] = []
+    mr2 = realpath_strict(mount_root)
+    try:
+        text2 = Path("/proc/mounts").read_text(encoding="utf-8")
+    except Exception:
+        return out2
+
+    for line in text2.splitlines():
         parts = line.split()
         if len(parts) < 3:
             continue
         src, mp, fstype = parts[0], parts[1], parts[2]
-        if not fstype.startswith("fuse"):
+        if fstype != "fuse.sshfs":
             continue
-        # sshfs shows as fuse.sshfs (usually)
-        if fstype not in ("fuse.sshfs", "fuse"):
-            continue
-        mp_path = Path(mp)
         try:
-            realpath_strict(mp_path).relative_to(mr)
+            realpath_strict(Path(mp)).relative_to(mr2)
         except Exception:
             continue
-        out.append({"mountpoint": mp, "source": src, "fstype": fstype})
+        out2.append({"mountpoint": mp, "source": src, "fstype": fstype})
 
-    # stable ordering
+    out2.sort(key=lambda d: d["mountpoint"])
+    return out2
+
+
+def list_all_sshfs_mounts() -> list[dict[str, str]]:
+    """Return all fuse.sshfs mounts visible to this process."""
+    out: list[dict[str, str]] = []
+    if shutil_which("findmnt"):
+        r = run(["findmnt", "-rn", "-t", "fuse.sshfs", "-o", "TARGET,SOURCE,FSTYPE"], check=False)
+        for line in (r.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mp, src, fstype = parts[0], parts[1], parts[2]
+            out.append({"mountpoint": mp, "source": src, "fstype": fstype})
+    else:
+        try:
+            text = Path("/proc/mounts").read_text(encoding="utf-8")
+        except Exception:
+            return out
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            src, mp, fstype = parts[0], parts[1], parts[2]
+            if fstype != "fuse.sshfs":
+                continue
+            out.append({"mountpoint": mp, "source": src, "fstype": fstype})
     out.sort(key=lambda d: d["mountpoint"])
     return out
 
@@ -477,14 +525,42 @@ def cmd_list_shortcuts(args: argparse.Namespace, cfg_path: Path, cfg: dict[str, 
 
 def cmd_list_mounted(args: argparse.Namespace, cfg_path: Path, cfg: dict[str, Any]) -> int:
     defaults = parse_defaults(cfg)
-    entries = list_mounted_under(Path(defaults.mount_root))
+    entries = list_all_sshfs_mounts() if getattr(args, "all", False) else list_mounted_under(Path(defaults.mount_root))
     if not entries:
-        print("(no sshfs mounts under mount_root)")
+        if getattr(args, "all", False):
+            print("(no sshfs mounts)")
+        else:
+            print("(no sshfs mounts under mount_root)")
         return 0
     for e in entries:
         mp = e["mountpoint"]
         ident = Path(mp).name
         print(f"{ident}: mountpoint={mp} source={e['source']}")
+    return 0
+
+
+def cmd_debug_config(args: argparse.Namespace, cfg_path: Path, cfg: dict[str, Any]) -> int:
+    """Print resolved config + defaults + mount_root realpath."""
+    defaults = parse_defaults(cfg)
+    shortcuts = parse_shortcuts(cfg, defaults)
+
+    print(f"config_path={cfg_path}")
+    print(f"config_exists={cfg_path.exists()}")
+    print(f"mount_root={defaults.mount_root}")
+    try:
+        print(f"mount_root_realpath={realpath_strict(Path(defaults.mount_root))}")
+    except Exception as ex:
+        print(f"mount_root_realpath=(error: {ex})")
+    print(f"default_subnet={defaults.default_subnet if defaults.default_subnet else '(unset)'}")
+    print(f"default_port={defaults.default_port}")
+    print(f"default_user={defaults.default_user if defaults.default_user else '(unset)'}")
+    print(f"shortcuts_count={len(shortcuts)}")
+
+    # quick mount visibility check
+    all_m = list_all_sshfs_mounts()
+    under = list_mounted_under(Path(defaults.mount_root))
+    print(f"sshfs_mounts_total={len(all_m)}")
+    print(f"sshfs_mounts_under_mount_root={len(under)}")
     return 0
 
 
@@ -802,7 +878,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list-mounted
     plm = sub.add_parser("list-mounted", help="List sshfs mounts under mount_root")
+    plm.add_argument("--all", action="store_true", help="List all sshfs mounts (ignore mount_root)")
     plm.set_defaults(func=cmd_list_mounted)
+
+    # debug-config
+    pdc = sub.add_parser("debug-config", help="Print resolved config and mount diagnostics")
+    pdc.set_defaults(func=cmd_debug_config)
 
     # unmount-all
     pua = sub.add_parser("unmount-all", help="Unmount all sshfs mounts under mount_root")

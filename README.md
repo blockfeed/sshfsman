@@ -26,6 +26,7 @@ that is:
 - bulk ops:
   - `list-mounted`
   - `unmount-all`
+  - `debug-config`
 
 ## Install
 
@@ -169,10 +170,22 @@ sshfsman set-default-subnet 10.0.20
 sshfsman list-mounted
 ```
 
+List all sshfs mounts (ignore mount_root):
+
+```bash
+sshfsman list-mounted --all
+```
+
 ### Unmount all sshfs under mount_root
 
 ```bash
 sshfsman unmount-all
+```
+
+### Debug config + mount visibility
+
+```bash
+sshfsman debug-config
 ```
 
 ## Safety model
