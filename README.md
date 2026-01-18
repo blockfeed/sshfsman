@@ -43,18 +43,6 @@ Run via wrapper:
 ./sshfsman.py --help
 ```
 
-## Shortcut invocation is saved (port, options, identity)
-
-When you create a shortcut via `mount --create-shortcut NAME` or `create-shortcut`, sshfsman saves the mount invocation parameters into the shortcut:
-
-- `port`
-- `identity`
-- `options` (sshfs `-o` values)
-- `readonly`
-- `no_reconnect_defaults`
-
-When you later run `sshfsman mount --shortcut NAME ...`, those saved parameters are applied automatically. CLI flags override saved values.
-
 ## Config
 
 Example `~/.config/sshfsman/config.toml`:
@@ -70,6 +58,8 @@ default_subnet = "192.0.2"
 id = "phone"
 remote = "user@192.0.2.10:/path"
 mount_dir = "phone"
+
+# Saved invocation parameters (optional)
 port = 2222
 identity = "/home/user/.ssh/id_ed25519"
 options = [
@@ -78,6 +68,42 @@ options = [
 readonly = false
 no_reconnect_defaults = false
 ```
+
+### Config keys
+
+- `config.mount_root`
+  - Mount root for all sshfs mounts managed by sshfsman.
+  - Default: `/mnt/sshfs`
+- `config.default_subnet`
+  - Optional, three octets (example: `192.0.2`)
+  - Used only when a shortcut remote does **not** contain an IPv4 host and you pass an ID override.
+- `shortcuts."<NAME>"`
+  - `remote` (required): `user@host:/path`
+  - `mount_dir` (optional): directory name under `mount_root`
+  - Saved invocation parameters (optional): `port`, `identity`, `options`, `readonly`, `no_reconnect_defaults`
+
+## Shortcut invocation is saved (port, options, identity)
+
+When you create a shortcut via:
+
+- `sshfsman mount --create-shortcut NAME ...`, or
+- `sshfsman create-shortcut NAME ...`
+
+sshfsman saves the mount invocation parameters into that shortcut:
+
+- `port`
+- `identity`
+- `options` (sshfs `-o` values)
+- `readonly`
+- `no_reconnect_defaults`
+
+Later, when you run:
+
+- `sshfsman mount --shortcut NAME ...`
+
+those saved parameters are applied automatically. CLI flags override saved values.
+
+This avoids “works once, fails later” when the original mount used a non-default port or other options.
 
 ## Commands
 
@@ -129,6 +155,8 @@ Emit JSON:
 ```bash
 sshfsman list-mounts --json
 ```
+
+Note: `list-mounted` is removed (hard break). Use `list-mounts`.
 
 ### unmount
 
@@ -216,6 +244,33 @@ Print resolved config and mount diagnostics under `mount_root`:
 
 ```bash
 sshfsman debug-config
+```
+
+## Troubleshooting
+
+### “already mounted” when nothing is mounted
+
+sshfsman only treats a path as mounted if `findmnt -T <path>` reports `FSTYPE=fuse.sshfs`.
+Verify directly:
+
+```bash
+findmnt -T /mnt/sshfs/phone -o TARGET,FSTYPE,SOURCE
+```
+
+### “Connection reset by peer” after switching to a shortcut
+
+If the original mount used a non-default port (or other options) and the shortcut did not save them, reconnects can fail.
+
+Fix: recreate or overwrite the shortcut while specifying the working invocation:
+
+```bash
+sshfsman mount --remote user@192.0.2.10:/path --port 2222 --create-shortcut phone
+```
+
+Then use:
+
+```bash
+sshfsman mount --shortcut phone 138
 ```
 
 ## License
