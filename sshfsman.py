@@ -186,7 +186,16 @@ def do_mount(spec: MountSpec) -> None:
         die(f"mount command succeeded but mount not detected at {spec.mountpoint}", code=1)
 
 
-def do_unmount(mountpoint: Path) -> None:
+def dir_is_empty(p: Path) -> bool:
+    """Return True if directory contains no entries."""
+    try:
+        next(p.iterdir())
+        return False
+    except StopIteration:
+        return True
+
+
+def do_unmount(mountpoint: Path, *, prune_empty_dir: bool = True) -> None:
     _, fusermount = ensure_tools(password=False, non_interactive=False)
 
     if not mountpoint.exists():
@@ -200,6 +209,10 @@ def do_unmount(mountpoint: Path) -> None:
 
     if is_mounted(mountpoint):
         die(f"unmount command succeeded but still mounted: {mountpoint}", code=1)
+
+    # Prune the mountpoint directory if it is now unmounted + empty.
+    if prune_empty_dir and mountpoint.exists() and mountpoint.is_dir() and dir_is_empty(mountpoint):
+        mountpoint.rmdir()
 
 
 def main() -> None:
@@ -241,6 +254,11 @@ def main() -> None:
     pu = sub.add_parser("unmount", help="Unmount an identifier")
     pu.add_argument("--id", required=True, type=validate_identifier, help="Identifier to unmount")
     pu.add_argument("--mount-root", default=str(DEFAULT_ROOT), help=f"Mount root (default: {DEFAULT_ROOT})")
+    pu.add_argument(
+        "--keep-dir",
+        action="store_true",
+        help="Do not remove /mnt/sshfs/<id> after unmount (default: prune if empty)",
+    )
 
     ps = sub.add_parser("status", help="Show whether an identifier is mounted")
     ps.add_argument("--id", required=True, type=validate_identifier, help="Identifier to check")
@@ -269,7 +287,7 @@ def main() -> None:
 
     if args.cmd == "unmount":
         mp = mount_root / args.id
-        do_unmount(mp)
+        do_unmount(mp, prune_empty_dir=not args.keep_dir)
         print(str(mp))
         return
 
