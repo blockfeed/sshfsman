@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshfsman"
+version = "0.3.0"
+description = "CLI for mounting/unmounting sshfs targets under /mnt/sshfs with XDG config shortcuts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "John Mora" }]
+keywords = ["sshfs", "fuse", "ssh", "sftp", "linux", "cli", "sysadmin"]
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: Console",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+sshfsman = "sshfsman.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

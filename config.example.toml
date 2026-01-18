@@ -1,0 +1,21 @@
+[defaults]
+mount_root = "/mnt/sshfs"
+default_port = 22
+# prefix for last-octet addressing, e.g. "10.0.20" + ".138"
+default_subnet = "10.0.20"
+default_user = "user"
+
+[shortcuts.my-phone]
+# mountpoint id (directory name). if omitted, defaults to shortcut name.
+id = "my-phone"
+# path on the remote host (no host/user here)
+remote_path = "/home/user/files"
+port = 2222
+
+# Auth / SSH behavior
+prefer_password = false
+# disable_pubkey = false
+# insecure_hostkey = false
+
+# Extra sshfs -o options (optional)
+# extra_sshfs_opts = ["idmap=user"]
