@@ -870,8 +870,12 @@ Examples
   # List sshfs mounts under mount_root
   sshfsman list-mounts
 
-  # Unmount everything under mount_root
+  # Unmount everything under mount_root (normal, safe behavior)
   sshfsman unmount-all
+
+  # Unmount ALL sshfs mounts on the system, including those outside mount_root
+  # This is rarely needed and should be used with care
+  sshfsman unmount-all --all
 
   # Set default_subnet (three octets)
   sshfsman set-default-subnet 192.0.2
@@ -919,8 +923,8 @@ def build_parser() -> argparse.ArgumentParser:
     pu.set_defaults(func=cmd_unmount)
 
     # unmount-all
-    pua = sub.add_parser("unmount-all", help="Unmount all sshfs mounts under mount_root")
-    pua.add_argument("--all", action="store_true", help="Also unmount fuse.sshfs mounts outside mount_root.")
+    pua = sub.add_parser("unmount-all", help="Unmount all sshfs mounts under mount_root (safe default)")
+    pua.add_argument("--all", action="store_true", help="Also unmount ALL fuse.sshfs mounts on the system (dangerous; ignores mount_root).")
     pua.set_defaults(func=cmd_unmount_all)
 
     # status
