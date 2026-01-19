@@ -8,7 +8,7 @@ It is intended for workflows where the same remote filesystems are mounted frequ
 
 ## Motivation
 
-I like `sftpman`, but my needs are different here: I wanted a CLI that could manage filesystem mounts explicitly and tolerate hosts whose addresses change over time.
+I use `sftpman` regularly for interactive file access. In practice, there are times when a full filesystem mount is the better tool, for example when copying or syncing larger sets of files.
 
 A common case is mounting storage exposed by a mobile device. Because modern devices often use randomized MAC addresses, the IP address can change between connections. Hard-coded mounts or shell aliases tend to break when that happens.
 
@@ -184,6 +184,13 @@ sshfsman mount --shortcut phone
 ```bash
 sshfsman mount --shortcut phone 138
 ```
+
+When a numeric argument is provided, sshfsman treats it as the **last octet** of an IPv4 address.
+It is combined with the configured `default_subnet` (for example `192.0.2`) to form the full host
+address (`192.0.2.138` in this case).
+
+This is intended for environments where a device is frequently readdressed within the same subnet.
+
 
 ---
 
