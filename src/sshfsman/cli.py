@@ -1,1004 +1,731 @@
-# SPDX-License-Identifier: GPL-3.0-only
+#!/usr/bin/env python3
 """
-sshfsman: manage sshfs mounts under a configurable mount root.
+sshfsman: CLI-first sshfs mount manager
 
-Authoritative mount detection (single ground truth everywhere):
-
-A path is considered sshfs-mounted ONLY if:
-
-    findmnt -T <path> shows FSTYPE == fuse.sshfs
-
-No use of mountpoint(1), directory existence, or loose /proc/mounts parsing.
+Design constraints:
+- Deterministic mount detection: a path is "mounted" iff findmnt -T <path> reports FSTYPE=fuse.sshfs
+- No heuristic checks (directory existence, mountpoint(1), /proc/mounts parsing)
+- Manage mounts under a configurable mount_root (default: /mnt/sshfs)
+- XDG config: ~/.config/sshfsman/config.toml
+- Shortcuts persist mount invocation parameters (port/identity/options/readonly/no_reconnect_defaults)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
-import shlex
-import subprocess
 import sys
+import subprocess
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    import tomllib  # py>=3.11
+    import tomllib  # py3.11+
 except Exception:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
+    tomllib = None  # type: ignore
+
 
 APP_NAME = "sshfsman"
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-CONFIG_PATH = XDG_CONFIG_HOME / APP_NAME / "config.toml"
+DEFAULT_CONFIG_PATH = XDG_CONFIG_HOME / APP_NAME / "config.toml"
 
-FSTYPE_SSHFS = "fuse.sshfs"
+DEFAULT_MOUNT_ROOT = Path("/mnt/sshfs")
+DEFAULT_SUBNET = ""  # empty means disabled
 
 
-# ----------------------------
-# Config model
-# ----------------------------
+class SshfsmanError(RuntimeError):
+    pass
 
-@dataclass(frozen=True)
+
+@dataclass
+class Defaults:
+    mount_root: Path = DEFAULT_MOUNT_ROOT
+    default_subnet: str = DEFAULT_SUBNET  # e.g. "192.0.2"
+
+
+@dataclass
 class Shortcut:
     name: str
-    id: str
     remote: str
-    mount_dir: str
+    mount_dir: Optional[str] = None
 
-    # Saved invocation parameters (so shortcut mounts are repeatable)
+    # Saved invocation parameters (optional)
     port: Optional[int] = None
     identity: Optional[str] = None
-    options: Tuple[str, ...] = ()
-    readonly: bool = False
-    no_reconnect_defaults: bool = False
+    options: List[str] = None  # sshfs -o values (strings)
+    readonly: Optional[bool] = None
+    no_reconnect_defaults: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.options is None:
+            self.options = []
 
 
-@dataclass(frozen=True)
-class AppConfig:
-    mount_root: Path
-    default_subnet: Optional[str]
-    shortcuts: Dict[str, Shortcut]
+def _die(msg: str, code: int = 2) -> None:
+    print(f"{APP_NAME}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
 
 
-def _default_mount_root() -> Path:
-    return Path("/mnt/sshfs")
+def _run(cmd: List[str], *, check: bool = False, capture: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            check=check,
+            text=True,
+            capture_output=capture,
+        )
+    except FileNotFoundError:
+        _die(f"missing dependency: {cmd[0]!r} not found in PATH")
 
 
-def _read_config(path: Path = CONFIG_PATH) -> AppConfig:
-    mount_root = _default_mount_root()
-    default_subnet: Optional[str] = None
+def _load_config(config_path: Path) -> Tuple[Defaults, Dict[str, Shortcut]]:
+    defaults = Defaults()
     shortcuts: Dict[str, Shortcut] = {}
 
-    if not path.exists():
-        return AppConfig(mount_root=mount_root, default_subnet=default_subnet, shortcuts=shortcuts)
+    if not config_path.exists():
+        return defaults, shortcuts
 
     if tomllib is None:
-        raise RuntimeError("tomllib unavailable (requires Python 3.11+)")
+        _die("Python tomllib not available (requires Python 3.11+)")
 
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _die(f"failed to read config {config_path}: {e}")
 
     cfg = data.get("config", {}) if isinstance(data, dict) else {}
-    mr = cfg.get("mount_root")
-    if isinstance(mr, str) and mr.strip():
-        mount_root = Path(mr).expanduser()
+    if isinstance(cfg, dict):
+        mount_root = cfg.get("mount_root")
+        if isinstance(mount_root, str) and mount_root.strip():
+            defaults.mount_root = Path(mount_root).expanduser()
+        subnet = cfg.get("default_subnet")
+        if isinstance(subnet, str):
+            defaults.default_subnet = subnet.strip()
 
-    ds = cfg.get("default_subnet")
-    if isinstance(ds, str) and ds.strip():
-        default_subnet = ds.strip()
-
-    raw_shortcuts = data.get("shortcuts", {}) if isinstance(data, dict) else {}
-    if isinstance(raw_shortcuts, dict):
-        for name, sc in raw_shortcuts.items():
-            if not isinstance(name, str) or not isinstance(sc, dict):
+    sc = data.get("shortcuts", {}) if isinstance(data, dict) else {}
+    if isinstance(sc, dict):
+        for name, val in sc.items():
+            if not isinstance(name, str):
                 continue
-
-            sid = sc.get("id", name)
-            remote = sc.get("remote")
-            mount_dir = sc.get("mount_dir", name)
-
-            if not isinstance(sid, str) or not sid.strip():
-                sid = name
+            if not isinstance(val, dict):
+                continue
+            remote = val.get("remote")
             if not isinstance(remote, str) or not remote.strip():
                 continue
-            if not isinstance(mount_dir, str) or not mount_dir.strip():
-                mount_dir = name
+            mount_dir = val.get("mount_dir")
+            if mount_dir is not None and not isinstance(mount_dir, str):
+                mount_dir = None
 
-            # Optional persisted invocation args
-            port = sc.get("port")
-            if isinstance(port, int):
-                if not (1 <= port <= 65535):
-                    port = None
-            else:
-                port = None
-
-            identity = sc.get("identity")
-            if not isinstance(identity, str) or not identity.strip():
-                identity = None
-            else:
-                identity = identity.strip()
-
-            readonly = bool(sc.get("readonly", False))
-            no_reconnect_defaults = bool(sc.get("no_reconnect_defaults", False))
-
-            options_raw = sc.get("options", [])
-            options: List[str] = []
-            if isinstance(options_raw, list):
-                for o in options_raw:
-                    if isinstance(o, str) and o.strip():
-                        options.append(o.strip())
-            elif isinstance(options_raw, str) and options_raw.strip():
-                # tolerate legacy string form
-                options.append(options_raw.strip())
-
-            shortcuts[name] = Shortcut(
+            s = Shortcut(
                 name=name,
-                id=sid.strip(),
                 remote=remote.strip(),
-                mount_dir=_sanitize_mount_dir(mount_dir.strip()),
-                port=port,
-                identity=identity,
-                options=tuple(options),
-                readonly=readonly,
-                no_reconnect_defaults=no_reconnect_defaults,
+                mount_dir=mount_dir.strip() if isinstance(mount_dir, str) and mount_dir.strip() else None,
+                port=val.get("port") if isinstance(val.get("port"), int) else None,
+                identity=val.get("identity") if isinstance(val.get("identity"), str) else None,
+                options=list(val.get("options")) if isinstance(val.get("options"), list) else [],
+                readonly=val.get("readonly") if isinstance(val.get("readonly"), bool) else None,
+                no_reconnect_defaults=val.get("no_reconnect_defaults") if isinstance(val.get("no_reconnect_defaults"), bool) else None,
             )
+            shortcuts[name] = s
 
-    return AppConfig(mount_root=mount_root, default_subnet=default_subnet, shortcuts=shortcuts)
+    return defaults, shortcuts
 
 
-def _write_config(cfg: AppConfig, path: Path = CONFIG_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_config(config_path: Path, defaults: Defaults, shortcuts: Dict[str, Shortcut]) -> None:
+    """
+    Minimal TOML writer to avoid new dependencies.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def esc(s: str) -> str:
+    def toml_escape(s: str) -> str:
         return s.replace("\\", "\\\\").replace('"', '\\"')
 
     lines: List[str] = []
     lines.append("[config]")
-    lines.append(f'mount_root = "{esc(str(cfg.mount_root))}"')
-    if cfg.default_subnet:
-        lines.append(f'default_subnet = "{esc(cfg.default_subnet)}"')
+    lines.append(f'mount_root = "{toml_escape(str(defaults.mount_root))}"')
+    if defaults.default_subnet:
+        lines.append(f'default_subnet = "{toml_escape(defaults.default_subnet)}"')
     lines.append("")
     lines.append("[shortcuts]")
+    lines.append("")
 
-    for name in sorted(cfg.shortcuts.keys()):
-        sc = cfg.shortcuts[name]
-        lines.append(f'[shortcuts."{esc(name)}"]')
-        lines.append(f'id = "{esc(sc.id)}"')
-        lines.append(f'remote = "{esc(sc.remote)}"')
-        lines.append(f'mount_dir = "{esc(sc.mount_dir)}"')
+    for name in sorted(shortcuts.keys()):
+        s = shortcuts[name]
+        lines.append(f'[shortcuts."{toml_escape(name)}"]')
+        lines.append(f'remote = "{toml_escape(s.remote)}"')
+        if s.mount_dir:
+            lines.append(f'mount_dir = "{toml_escape(s.mount_dir)}"')
 
-        if sc.port is not None:
-            lines.append(f"port = {int(sc.port)}")
-        if sc.identity:
-            lines.append(f'identity = "{esc(sc.identity)}"')
-        if sc.options:
+        if s.port is not None:
+            lines.append(f"port = {int(s.port)}")
+        if s.identity:
+            lines.append(f'identity = "{toml_escape(s.identity)}"')
+        if s.options:
             lines.append("options = [")
-            for o in sc.options:
-                lines.append(f'  "{esc(o)}",')
+            for opt in s.options:
+                lines.append(f'  "{toml_escape(str(opt))}",')
             lines.append("]")
-        if sc.readonly:
-            lines.append("readonly = true")
-        if sc.no_reconnect_defaults:
-            lines.append("no_reconnect_defaults = true")
+        if s.readonly is not None:
+            lines.append(f"readonly = {'true' if s.readonly else 'false'}")
+        if s.no_reconnect_defaults is not None:
+            lines.append(f"no_reconnect_defaults = {'true' if s.no_reconnect_defaults else 'false'}")
 
         lines.append("")
 
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-# ----------------------------
-# Ground-truth mount detection
-# ----------------------------
-
-def is_sshfs_mounted(target_path: Path) -> bool:
-    """
-    Single ground truth:
-
-    A path is considered mounted only if:
-
-        findmnt -T <path> shows FSTYPE == fuse.sshfs
-    """
-    target_path = target_path.expanduser()
-
-    if not target_path.exists():
-        return False
-
-    cmd = ["findmnt", "-n", "-T", str(target_path), "-o", "FSTYPE"]
-    try:
-        cp = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    except FileNotFoundError:
-        raise RuntimeError("findmnt not found; required for sshfsman mount detection")
-
+def _findmnt_fstype_for_path(path: Path) -> Optional[str]:
+    cp = _run(["findmnt", "-T", str(path), "-n", "-o", "FSTYPE"], capture=True)
     if cp.returncode != 0:
-        return False
-
-    fstype = (cp.stdout or "").strip()
-    return fstype == FSTYPE_SSHFS
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-_IPV4_RE = re.compile(r"^(?P<a>\d{1,3})\.(?P<b>\d{1,3})\.(?P<c>\d{1,3})\.(?P<d>\d{1,3})$")
+        return None
+    out = (cp.stdout or "").strip()
+    return out or None
 
 
-def _is_ipv4(s: str) -> bool:
-    m = _IPV4_RE.match(s.strip())
-    if not m:
-        return False
-    parts = [int(m.group(k)) for k in ("a", "b", "c", "d")]
-    return all(0 <= p <= 255 for p in parts)
+def is_sshfs_mounted(path: Path) -> bool:
+    fstype = _findmnt_fstype_for_path(path)
+    return fstype == "fuse.sshfs"
 
 
-def _replace_last_octet(ip: str, last: str) -> str:
-    if not _is_ipv4(ip):
-        return ip
-    if not last.isdigit():
-        return ip
-    v = int(last)
-    if not (0 <= v <= 255):
-        return ip
-    a, b, c, _ = ip.split(".")
-    return f"{a}.{b}.{c}.{v}"
-
-
-def _sanitize_mount_dir(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "mount"
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    name = re.sub(r"_+", "_", name).strip("_.-")
-    return name or "mount"
-
-
-def _run(cmd: List[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, check=False)
-
-
-def _run_checked(cmd: List[str], *, what: str) -> None:
-    cp = _run(cmd)
-    if cp.returncode != 0:
-        stderr = (cp.stderr or "").strip()
-        stdout = (cp.stdout or "").strip()
-        msg = f"{what} failed: {shlex.join(cmd)}"
-        if stdout:
-            msg += f"\nstdout: {stdout}"
-        if stderr:
-            msg += f"\nstderr: {stderr}"
-        raise RuntimeError(msg)
-
-
-def _parse_remote(remote: str) -> Tuple[str, str]:
-    """
-    Parse 'user@host:/path' into ('user@host', '/path').
-    """
-    if ":" not in remote:
-        raise ValueError("remote must be in the form user@host:/path")
-    left, right = remote.split(":", 1)
-    if not left or not right:
-        raise ValueError("remote must be in the form user@host:/path")
-    if not right.startswith("/"):
-        right = "/" + right
-    return left, right
-
-
-def _build_remote_from_shortcut(sc: Shortcut, id_override: Optional[str], default_subnet: Optional[str]) -> str:
-    """
-    If id_override is provided:
-
-    - If shortcut remote contains an IPv4 host, replace last octet with id_override.
-    - Else, if default_subnet exists and id_override is 0..255, use default_subnet.id_override.
-    - Otherwise, leave remote unchanged.
-    """
-    remote = sc.remote
-    if not id_override:
-        return remote
-
-    userhost, path = _parse_remote(remote)
-    if "@" in userhost:
-        user, host = userhost.split("@", 1)
-        prefix = user + "@"
-    else:
-        host = userhost
-        prefix = ""
-
-    host = host.strip()
-    new_host = host
-
-    if _is_ipv4(host):
-        new_host = _replace_last_octet(host, id_override)
-    elif default_subnet and id_override.isdigit():
-        v = int(id_override)
-        if 0 <= v <= 255:
-            new_host = f"{default_subnet}.{v}"
-
-    return f"{prefix}{new_host}:{path}"
-
-
-def _infer_mount_dir_from_remote(remote: str) -> str:
-    userhost, path = _parse_remote(remote)
-    host = userhost.split("@", 1)[-1]
-    base = Path(path).name or host
-    return _sanitize_mount_dir(base)
-
-
-def _ensure_under_mount_root(mount_root: Path, p: Path) -> None:
-    mr = mount_root.resolve()
-    pp = p.resolve()
-    try:
-        pp.relative_to(mr)
-    except Exception as e:
-        raise RuntimeError(f"refusing to operate outside mount_root: {pp} (mount_root={mr})") from e
-
-
-def _safe_prune_empty_dirs(mount_root: Path, start: Path) -> None:
-    """
-    Safety:
-    - Only under mount_root
-    - Only empty directories via rmdir()
-    - Only if NOT sshfs-mounted (ground truth)
-    - Never recurse-delete; prune upward at most to mount_root
-    """
-    mount_root = mount_root.resolve()
-    cur = start.resolve()
-
-    while True:
-        if cur == mount_root:
-            return
-
-        _ensure_under_mount_root(mount_root, cur)
-
-        if is_sshfs_mounted(cur):
-            return
-
-        try:
-            cur.rmdir()
-        except OSError:
-            return
-
-        parent = cur.parent
-        if parent == cur:
-            return
-        cur = parent
-
-
-def _find_sshfs_mounts_system() -> List[Tuple[Path, str]]:
-    """
-    Return [(target, source), ...] for all fuse.sshfs mounts on the system.
-    """
-    cmd = ["findmnt", "-rn", "-t", FSTYPE_SSHFS, "-o", "TARGET,SOURCE,FSTYPE"]
-    try:
-        cp = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    except FileNotFoundError:
-        raise RuntimeError("findmnt not found; required for sshfsman mount listing")
-
+def _list_fuse_sshfs_mounts() -> List[Dict[str, str]]:
+    cp = _run(["findmnt", "-t", "fuse.sshfs", "-n", "-o", "TARGET,SOURCE,FSTYPE"], capture=True)
     if cp.returncode != 0:
         return []
-
-    mounts: List[Tuple[Path, str]] = []
+    mounts: List[Dict[str, str]] = []
     for line in (cp.stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
         parts = line.split()
         if len(parts) < 3:
             continue
-        target, source, fstype = parts[0], parts[1], parts[2]
-        if fstype != FSTYPE_SSHFS:
-            continue
-        mounts.append((Path(target), source))
+        mounts.append({"TARGET": parts[0], "SOURCE": parts[1], "FSTYPE": parts[2]})
     return mounts
 
 
-def _validate_default_subnet(s: str) -> str:
-    s = (s or "").strip()
-    parts = s.split(".")
-    if len(parts) != 3:
-        raise ValueError("default_subnet must be three octets like 192.0.2")
-    out = []
-    for p in parts:
-        if not p.isdigit():
-            raise ValueError("default_subnet must be three octets like 192.0.2")
-        v = int(p)
-        if not (0 <= v <= 255):
-            raise ValueError("default_subnet octets must be 0..255")
-        out.append(str(v))
-    return ".".join(out)
-
-
-def _resolve_mountpoint_from_shortcut(cfg: AppConfig, name: str) -> Path:
-    sc = cfg.shortcuts.get(name)
-    if sc is None:
-        raise RuntimeError(f"unknown shortcut: {name}")
-    mount_name = _sanitize_mount_dir(sc.mount_dir or sc.name)
-    return (cfg.mount_root.expanduser().resolve() / mount_name).resolve()
-
-
-def _merge_saved_and_cli_mount_args(sc: Optional[Shortcut], args: argparse.Namespace) -> dict:
-    """
-    Determine mount invocation parameters.
-    CLI flags override saved shortcut values.
-    """
-    port = args.port
-    identity = args.identity
-    readonly = args.readonly
-    no_reconnect_defaults = args.no_reconnect_defaults
-    options = list(args.options or [])
-
-    if sc is not None:
-        if port is None:
-            port = sc.port
-        if identity is None:
-            identity = sc.identity
-        if not readonly:
-            readonly = sc.readonly
-        if not no_reconnect_defaults:
-            no_reconnect_defaults = sc.no_reconnect_defaults
-        if not options and sc.options:
-            options = list(sc.options)
-
-    # Normalize options: split comma-delimited parts.
-    norm: List[str] = []
-    for o in options:
-        if not isinstance(o, str):
-            continue
-        for part in o.split(","):
-            part = part.strip()
-            if part:
-                norm.append(part)
-
-    return {
-        "port": port,
-        "identity": identity,
-        "readonly": readonly,
-        "no_reconnect_defaults": no_reconnect_defaults,
-        "options": tuple(norm),
-    }
-
-
-# ----------------------------
-# Commands
-# ----------------------------
-
-def cmd_debug_config(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser().resolve()
-    print(f"config_path: {CONFIG_PATH}")
-    print(f"mount_root:  {mr}")
-    print(f"default_subnet: {cfg.default_subnet or ''}")
-    print("shortcuts:")
-    for name in sorted(cfg.shortcuts.keys()):
-        sc = cfg.shortcuts[name]
-        print(f"  - {name}")
-        print(f"      id: {sc.id}")
-        print(f"      remote: {sc.remote}")
-        print(f"      mount_dir: {sc.mount_dir}")
-        if sc.port is not None:
-            print(f"      port: {sc.port}")
-        if sc.identity:
-            print(f"      identity: {sc.identity}")
-        if sc.options:
-            print(f"      options: {', '.join(sc.options)}")
-        if sc.readonly:
-            print("      readonly: true")
-        if sc.no_reconnect_defaults:
-            print("      no_reconnect_defaults: true")
-
-    print("")
-    print("mounts_under_mount_root:")
-    for target, source in _find_sshfs_mounts_system():
-        try:
-            target.resolve().relative_to(mr)
-        except Exception:
-            continue
-        print(f"  - {target}  {source}")
-
-    return 0
-
-
-def cmd_list_mounts(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser().resolve()
-
-    mounts = _find_sshfs_mounts_system()
-    rows: List[Tuple[str, str]] = []
-    for target, source in mounts:
-        t = target.resolve()
-        if not args.all:
-            try:
-                t.relative_to(mr)
-            except Exception:
-                continue
-        rows.append((str(t), source))
-
-    if args.json:
-        import json as _json  # stdlib
-
-        print(_json.dumps([{"target": t, "source": s} for t, s in rows], indent=2, sort_keys=True))
-        return 0
-
-    if not rows:
-        return 0
-
-    width = max(len(t) for t, _ in rows)
-    for t, s in rows:
-        print(f"{t.ljust(width)}  {s}")
-    return 0
-
-
-def cmd_list_shortcuts(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-
-    if args.json:
-        import json as _json  # stdlib
-
-        payload = []
-        for name in sorted(cfg.shortcuts.keys()):
-            sc = cfg.shortcuts[name]
-            payload.append(
-                {
-                    "name": name,
-                    "id": sc.id,
-                    "remote": sc.remote,
-                    "mount_dir": sc.mount_dir,
-                    "port": sc.port,
-                    "identity": sc.identity,
-                    "options": list(sc.options),
-                    "readonly": sc.readonly,
-                    "no_reconnect_defaults": sc.no_reconnect_defaults,
-                }
-            )
-        print(_json.dumps(payload, indent=2, sort_keys=True))
-        return 0
-
-    if not cfg.shortcuts:
-        return 0
-
-    name_w = max(len(n) for n in cfg.shortcuts.keys())
-    for name in sorted(cfg.shortcuts.keys()):
-        sc = cfg.shortcuts[name]
-        extras: List[str] = []
-        if sc.port is not None:
-            extras.append(f"port={sc.port}")
-        if sc.identity:
-            extras.append("identity=…")
-        if sc.options:
-            extras.append(f"options={len(sc.options)}")
-        if sc.readonly:
-            extras.append("readonly")
-        if sc.no_reconnect_defaults:
-            extras.append("no_reconnect_defaults")
-        extra_s = ("  " + " ".join(extras)) if extras else ""
-        print(f"{name.ljust(name_w)}  id={sc.id}  mount_dir={sc.mount_dir}  remote={sc.remote}{extra_s}")
-    return 0
-
-
-def cmd_create_shortcut(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-
-    name = args.name
-    remote = args.remote
-    mount_dir = _sanitize_mount_dir(args.mount_dir or _infer_mount_dir_from_remote(remote))
-    sid = args.id or name
-
-    options = tuple(_split_options(args.options or []))
-
-    sc_new = Shortcut(
-        name=name,
-        id=sid,
-        remote=remote,
-        mount_dir=mount_dir,
-        port=args.port,
-        identity=args.identity,
-        options=options,
-        readonly=args.readonly,
-        no_reconnect_defaults=args.no_reconnect_defaults,
-    )
-
-    shortcuts = dict(cfg.shortcuts)
-    shortcuts[name] = sc_new  # overwrite
-    cfg2 = AppConfig(mount_root=cfg.mount_root, default_subnet=cfg.default_subnet, shortcuts=shortcuts)
-    _write_config(cfg2)
-    return 0
-
-
-def cmd_delete_shortcut(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    if args.name not in cfg.shortcuts:
-        return 0
-    shortcuts = dict(cfg.shortcuts)
-    del shortcuts[args.name]
-    cfg2 = AppConfig(mount_root=cfg.mount_root, default_subnet=cfg.default_subnet, shortcuts=shortcuts)
-    _write_config(cfg2)
-    return 0
-
-
-def cmd_set_default_subnet(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    subnet = _validate_default_subnet(args.subnet)
-    cfg2 = AppConfig(mount_root=cfg.mount_root, default_subnet=subnet, shortcuts=dict(cfg.shortcuts))
-    _write_config(cfg2)
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser().resolve()
-
-    if args.path:
-        target = Path(args.path).expanduser().resolve()
-        _ensure_under_mount_root(mr, target)
-        mounted = is_sshfs_mounted(target)
-        print("mounted" if mounted else "not mounted")
-        return 0
-
-    if args.shortcut:
-        target = _resolve_mountpoint_from_shortcut(cfg, args.shortcut)
-        mounted = is_sshfs_mounted(target)
-        print("mounted" if mounted else "not mounted")
-        return 0
-
-    rows: List[Tuple[str, str, str]] = []
-    for name in sorted(cfg.shortcuts.keys()):
-        target = _resolve_mountpoint_from_shortcut(cfg, name)
-        rows.append((name, str(target), "mounted" if is_sshfs_mounted(target) else "not mounted"))
-
-    if args.json:
-        import json as _json
-
-        print(_json.dumps([{"shortcut": n, "mountpoint": p, "status": s} for n, p, s in rows], indent=2, sort_keys=True))
-        return 0
-
-    if not rows:
-        return 0
-
-    n_w = max(len(n) for n, _, _ in rows)
-    p_w = max(len(p) for _, p, _ in rows)
-    for n, p, s in rows:
-        print(f"{n.ljust(n_w)}  {p.ljust(p_w)}  {s}")
-    return 0
-
-
-def _split_options(opts: List[str]) -> List[str]:
-    out: List[str] = []
-    for o in opts:
-        if not isinstance(o, str):
-            continue
-        for part in o.split(","):
-            part = part.strip()
-            if part:
-                out.append(part)
+def _filter_mounts_under_root(mounts: List[Dict[str, str]], mount_root: Path) -> List[Dict[str, str]]:
+    root = str(mount_root.resolve())
+    out: List[Dict[str, str]] = []
+    for m in mounts:
+        tgt = m.get("TARGET", "")
+        if tgt == root or tgt.startswith(root.rstrip("/") + "/"):
+            out.append(m)
     return out
 
 
-def cmd_mount(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser()
-    mr.mkdir(parents=True, exist_ok=True)
-
-    shortcut_name: Optional[str] = args.shortcut
-    remote: Optional[str] = args.remote
-    id_override: Optional[str] = args.id
-
-    created_shortcut: Optional[str] = args.create_shortcut
-    mount_dir: Optional[str] = args.mount_dir
-
-    if shortcut_name and remote:
-        raise RuntimeError("provide either --shortcut or --remote, not both")
-
-    if not shortcut_name and not remote:
-        raise RuntimeError("mount requires --shortcut NAME or --remote user@host:/path")
-
-    sc_for_args: Optional[Shortcut] = None
-
-    if shortcut_name:
-        sc = cfg.shortcuts.get(shortcut_name)
-        if sc is None:
-            raise RuntimeError(f"unknown shortcut: {shortcut_name}")
-        sc_for_args = sc
-        remote_final = _build_remote_from_shortcut(sc, id_override, cfg.default_subnet)
-        mount_name = _sanitize_mount_dir(mount_dir or sc.mount_dir or shortcut_name)
-    else:
-        remote_final = remote  # type: ignore[assignment]
-        mount_name = _sanitize_mount_dir(mount_dir or _infer_mount_dir_from_remote(remote_final))  # type: ignore[arg-type]
-
-    mountpoint = (mr / mount_name).resolve()
-    _ensure_under_mount_root(mr, mountpoint)
-
-    # Determine invocation params (shortcut-saved + CLI overrides)
-    inv = _merge_saved_and_cli_mount_args(sc_for_args, args)
-
-    # Shortcut behavior (required):
-    # --create-shortcut NAME does NOT require --id, sets id=NAME, overwrites existing shortcut.
-    if created_shortcut:
-        name = created_shortcut
-        sc_new = Shortcut(
-            name=name,
-            id=name,
-            remote=remote_final,
-            mount_dir=mount_name,
-            port=inv["port"],
-            identity=inv["identity"],
-            options=inv["options"],
-            readonly=bool(inv["readonly"]),
-            no_reconnect_defaults=bool(inv["no_reconnect_defaults"]),
-        )
-        shortcuts = dict(cfg.shortcuts)
-        shortcuts[name] = sc_new
-        cfg2 = AppConfig(mount_root=cfg.mount_root, default_subnet=cfg.default_subnet, shortcuts=shortcuts)
-        _write_config(cfg2)
-        cfg = cfg2
-
-    # Guard: only block if actually sshfs-mounted (ground truth)
-    if is_sshfs_mounted(mountpoint):
-        print(f"already mounted: {mountpoint}")
-        return 0
-
-    mountpoint.mkdir(parents=True, exist_ok=True)
-
-    cmd: List[str] = ["sshfs", remote_final, str(mountpoint)]
-
-    opts: List[str] = []
-    if not inv["no_reconnect_defaults"]:
-        opts.extend(["reconnect", "ServerAliveInterval=15", "ServerAliveCountMax=3"])
-    if inv["readonly"]:
-        opts.append("ro")
-    if inv["options"]:
-        opts.extend(list(inv["options"]))
-
-    for o in opts:
-        cmd.extend(["-o", o])
-
-    if inv["port"] is not None:
-        cmd.extend(["-p", str(inv["port"])])
-    if inv["identity"]:
-        cmd.extend(["-o", f"IdentityFile={inv['identity']}"])
-
-    _run_checked(cmd, what="sshfs mount")
-
-    if not is_sshfs_mounted(mountpoint):
-        raise RuntimeError(f"mount command succeeded but mount not detected as {FSTYPE_SSHFS} via findmnt: {mountpoint}")
-
-    return 0
-
-
-def _unmount_one(mount_root: Path, target: Path) -> None:
-    target = target.resolve()
-    _ensure_under_mount_root(mount_root, target)
-
-    if not is_sshfs_mounted(target):
+def _safe_rmdir_empty_under_root(path: Path, mount_root: Path) -> None:
+    try:
+        path = path.resolve()
+        mount_root = mount_root.resolve()
+    except Exception:
         return
 
+    if path == mount_root:
+        return
+    if not str(path).startswith(str(mount_root).rstrip("/") + "/"):
+        return
+    if is_sshfs_mounted(path):
+        return
     try:
-        subprocess.run(["fusermount3", "-V"], text=True, capture_output=True, check=False)
-        use_fuse = True
-    except FileNotFoundError:
-        use_fuse = False
+        path.rmdir()
+    except OSError:
+        return
 
-    if use_fuse:
-        _run_checked(["fusermount3", "-u", str(target)], what="fusermount3 -u")
-    else:
-        _run_checked(["umount", str(target)], what="umount")
+
+def _resolve_host_with_optional_octet(remote: str, default_subnet: str, octet: Optional[str]) -> str:
+    if octet is None:
+        return remote
+
+    if not default_subnet:
+        _die("numeric host override provided but config.default_subnet is not set")
+
+    if not octet.isdigit():
+        _die(f"invalid host override {octet!r} (expected 1..254)")
+
+    n = int(octet)
+    if n < 1 or n > 254:
+        _die(f"invalid host override {octet!r} (expected 1..254)")
+
+    host = f"{default_subnet}.{n}"
+    if ":" not in remote:
+        return remote
+    lhs, rhs = remote.split(":", 1)
+    if "@" in lhs:
+        user, _oldhost = lhs.split("@", 1)
+        return f"{user}@{host}:{rhs}"
+    return f"{host}:{rhs}"
+
+
+def _build_sshfs_cmd(
+    remote: str,
+    target: Path,
+    *,
+    port: Optional[int],
+    identity: Optional[str],
+    options: List[str],
+    readonly: bool,
+    no_reconnect_defaults: bool,
+) -> List[str]:
+    cmd: List[str] = ["sshfs", remote, str(target)]
+
+    if not no_reconnect_defaults:
+        cmd += ["-o", "reconnect", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
+
+    if readonly:
+        cmd += ["-o", "ro"]
+
+    for opt in options:
+        cmd += ["-o", opt]
+
+    if port is not None:
+        cmd += ["-p", str(int(port))]
+
+    if identity:
+        cmd += ["-o", f"IdentityFile={identity}"]
+
+    return cmd
+
+
+def _default_mount_dir_from_remote(remote: str) -> str:
+    try:
+        after = remote.split(":", 1)[1]
+        return Path(after.rstrip("/")).name or "sshfs"
+    except Exception:
+        return "sshfs"
+
+
+def _mount(
+    defaults: Defaults,
+    *,
+    remote: str,
+    mount_dir: Optional[str],
+    port: Optional[int],
+    identity: Optional[str],
+    options: List[str],
+    readonly: bool,
+    no_reconnect_defaults: bool,
+) -> Path:
+    mount_root = defaults.mount_root
+    mount_root.mkdir(parents=True, exist_ok=True)
+
+    if not mount_dir:
+        mount_dir = _default_mount_dir_from_remote(remote)
+
+    target = (mount_root / mount_dir).resolve()
 
     if is_sshfs_mounted(target):
-        raise RuntimeError(f"unmount failed (still mounted as {FSTYPE_SSHFS}): {target}")
+        _die(f"already mounted: {target}")
 
-    _safe_prune_empty_dirs(mount_root, target)
+    target.mkdir(parents=True, exist_ok=True)
+
+    cmd = _build_sshfs_cmd(
+        remote,
+        target,
+        port=port,
+        identity=identity,
+        options=options,
+        readonly=readonly,
+        no_reconnect_defaults=no_reconnect_defaults,
+    )
+
+    cp = _run(cmd)
+    if cp.returncode != 0:
+        _die(f"sshfs mount failed: {' '.join(cmd)}")
+
+    return target
 
 
-def cmd_unmount(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser().resolve()
+def _unmount_path(path: Path, mount_root: Path) -> None:
+    if not is_sshfs_mounted(path):
+        return
 
+    cp = _run(["fusermount3", "-u", str(path)])
+    if cp.returncode != 0:
+        cp2 = _run(["fusermount", "-u", str(path)])
+        if cp2.returncode != 0:
+            _die(f"failed to unmount {path}")
+
+    _safe_rmdir_empty_under_root(path, mount_root)
+
+
+def _cmd_list_mounts(defaults: Defaults, args: argparse.Namespace) -> None:
+    mounts = _list_fuse_sshfs_mounts()
+    if not args.all:
+        mounts = _filter_mounts_under_root(mounts, defaults.mount_root)
+
+    if args.json:
+        print(json.dumps(mounts, indent=2, sort_keys=True))
+        return
+
+    for m in mounts:
+        print(f'{m["SOURCE"]}\t{m["TARGET"]}')
+
+
+def _cmd_list_shortcuts(shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
+    items = []
+    for name in sorted(shortcuts.keys()):
+        s = shortcuts[name]
+        items.append(
+            {
+                "name": name,
+                "remote": s.remote,
+                "mount_dir": s.mount_dir,
+                "port": s.port,
+                "identity": s.identity,
+                "options": list(s.options),
+                "readonly": s.readonly,
+                "no_reconnect_defaults": s.no_reconnect_defaults,
+            }
+        )
+
+    if args.json:
+        print(json.dumps(items, indent=2, sort_keys=True))
+        return
+
+    for it in items:
+        md = it.get("mount_dir") or ""
+        print(f'{it["name"]}\t{it["remote"]}\t{md}')
+
+
+def _cmd_create_shortcut(
+    config_path: Path,
+    defaults: Defaults,
+    shortcuts: Dict[str, Shortcut],
+    args: argparse.Namespace,
+) -> None:
+    sc = Shortcut(
+        name=args.name,
+        remote=args.remote.strip(),
+        mount_dir=args.mount_dir,
+        port=args.port,
+        identity=args.identity,
+        options=list(args.options or []),
+        readonly=bool(args.readonly),
+        no_reconnect_defaults=bool(args.no_reconnect_defaults),
+    )
+    shortcuts[args.name] = sc
+    _write_config(config_path, defaults, shortcuts)
+
+
+def _cmd_delete_shortcut(
+    config_path: Path,
+    defaults: Defaults,
+    shortcuts: Dict[str, Shortcut],
+    args: argparse.Namespace,
+) -> None:
+    if args.name in shortcuts:
+        shortcuts.pop(args.name)
+        _write_config(config_path, defaults, shortcuts)
+
+
+def _cmd_set_default_subnet(
+    config_path: Path,
+    defaults: Defaults,
+    shortcuts: Dict[str, Shortcut],
+    args: argparse.Namespace,
+) -> None:
+    subnet = args.subnet.strip()
+    if subnet:
+        parts = subnet.split(".")
+        if len(parts) != 3 or any((not p.isdigit() or int(p) < 0 or int(p) > 255) for p in parts):
+            _die("default_subnet must be three octets, e.g. 192.0.2")
+    defaults.default_subnet = subnet
+    _write_config(config_path, defaults, shortcuts)
+
+
+def _cmd_status(defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
     if args.path:
-        target = Path(args.path).expanduser().resolve()
-        _unmount_one(mr, target)
-        return 0
+        p = Path(args.path)
+        print("mounted" if is_sshfs_mounted(p) else "not-mounted")
+        return
 
     if args.shortcut:
-        target = _resolve_mountpoint_from_shortcut(cfg, args.shortcut)
-        _unmount_one(mr, target)
-        return 0
+        s = shortcuts.get(args.shortcut)
+        if not s:
+            _die(f"unknown shortcut: {args.shortcut}")
+        target = defaults.mount_root / (s.mount_dir or _default_mount_dir_from_remote(s.remote))
+        print("mounted" if is_sshfs_mounted(target) else "not-mounted")
+        return
 
-    raise RuntimeError("unmount requires --path PATH or --shortcut NAME")
-
-
-def cmd_unmount_all(args: argparse.Namespace) -> int:
-    cfg = _read_config()
-    mr = cfg.mount_root.expanduser().resolve()
-
-    mounts = _find_sshfs_mounts_system()
-    targets: List[Path] = []
-
-    for target, _source in mounts:
-        t = target.resolve()
-        if not args.all:
-            try:
-                t.relative_to(mr)
-            except Exception:
-                continue
-        targets.append(t)
-
-    targets = sorted(set(targets), key=lambda p: (len(str(p)), str(p)), reverse=True)
-
-    for t in targets:
-        if args.all:
-            if is_sshfs_mounted(t):
-                try:
-                    subprocess.run(["fusermount3", "-V"], text=True, capture_output=True, check=False)
-                    use_fuse = True
-                except FileNotFoundError:
-                    use_fuse = False
-
-                if use_fuse:
-                    _run_checked(["fusermount3", "-u", str(t)], what="fusermount3 -u")
-                else:
-                    _run_checked(["umount", str(t)], what="umount")
-
-                if is_sshfs_mounted(t):
-                    raise RuntimeError(f"unmount-all failed (still mounted as {FSTYPE_SSHFS}): {t}")
-
-                try:
-                    t.relative_to(mr)
-                    _safe_prune_empty_dirs(mr, t)
-                except Exception:
-                    pass
-            continue
-
-        _unmount_one(mr, t)
-
-    return 0
+    for name in sorted(shortcuts.keys()):
+        s = shortcuts[name]
+        target = defaults.mount_root / (s.mount_dir or _default_mount_dir_from_remote(s.remote))
+        state = "mounted" if is_sshfs_mounted(target) else "not-mounted"
+        print(f"{name}\t{state}\t{target}")
 
 
-# ----------------------------
-# CLI
-# ----------------------------
+def _cmd_mount(
+    config_path: Path,
+    defaults: Defaults,
+    shortcuts: Dict[str, Shortcut],
+    args: argparse.Namespace,
+) -> None:
+    if args.remote:
+        remote = args.remote.strip()
+        target = _mount(
+            defaults,
+            remote=remote,
+            mount_dir=args.mount_dir,
+            port=args.port,
+            identity=args.identity,
+            options=list(args.options or []),
+            readonly=bool(args.readonly),
+            no_reconnect_defaults=bool(args.no_reconnect_defaults),
+        )
+        if args.create_shortcut:
+            name = args.create_shortcut
+            shortcuts[name] = Shortcut(
+                name=name,
+                remote=remote,
+                mount_dir=args.mount_dir or target.name,
+                port=args.port,
+                identity=args.identity,
+                options=list(args.options or []),
+                readonly=bool(args.readonly),
+                no_reconnect_defaults=bool(args.no_reconnect_defaults),
+            )
+            _write_config(config_path, defaults, shortcuts)
+        print(str(target))
+        return
 
-HELP_EXAMPLES = r"""
-Examples
+    shortcut_name = args.shortcut_name or args.shortcut
+    if not shortcut_name:
+        _die("mount requires either --remote or a shortcut name (sshfsman mount <name> [octet])")
 
-  # Mount by remote and create/overwrite a shortcut named "phone" (port saved in shortcut)
-  sshfsman mount --remote user@192.0.2.10:/path --port 2222 --create-shortcut phone
+    sc = shortcuts.get(shortcut_name)
+    if not sc:
+        _die(f"unknown shortcut: {shortcut_name}")
 
-  # Mount using a shortcut, overriding the last octet of the shortcut's IPv4 host
-  sshfsman mount --shortcut phone 138
+    remote = _resolve_host_with_optional_octet(sc.remote, defaults.default_subnet, args.octet)
 
-  # Create/overwrite a shortcut explicitly (including saved port/options)
-  sshfsman create-shortcut phone --remote user@192.0.2.10:/path --port 2222 -o allow_other
+    port = args.port if args.port is not None else sc.port
+    identity = args.identity if args.identity is not None else sc.identity
+    readonly = bool(args.readonly) if args.readonly else bool(sc.readonly) if sc.readonly is not None else False
+    no_reconnect_defaults = bool(args.no_reconnect_defaults) if args.no_reconnect_defaults else bool(sc.no_reconnect_defaults) if sc.no_reconnect_defaults is not None else False
+    options = list(sc.options or [])
+    if args.options:
+        options.extend(list(args.options))
 
-  # List sshfs mounts under mount_root
-  sshfsman list-mounts
+    mount_dir = args.mount_dir if args.mount_dir is not None else sc.mount_dir
 
-  # Unmount everything under mount_root (normal, safe behavior)
-  sshfsman unmount-all
+    target = _mount(
+        defaults,
+        remote=remote,
+        mount_dir=mount_dir,
+        port=port,
+        identity=identity,
+        options=options,
+        readonly=readonly,
+        no_reconnect_defaults=no_reconnect_defaults,
+    )
+    print(str(target))
 
-  # Unmount ALL sshfs mounts on the system, including those outside mount_root
-  # This is rarely needed and should be used with care
-  sshfsman unmount-all --all
 
-  # Set default_subnet (three octets)
-  sshfsman set-default-subnet 192.0.2
-""".rstrip()
+def _cmd_unmount(defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
+    mount_root = defaults.mount_root
+
+    if args.path:
+        _unmount_path(Path(args.path), mount_root)
+        return
+
+    if args.shortcut:
+        s = shortcuts.get(args.shortcut)
+        if not s:
+            _die(f"unknown shortcut: {args.shortcut}")
+        target = mount_root / (s.mount_dir or _default_mount_dir_from_remote(s.remote))
+        _unmount_path(target, mount_root)
+        return
+
+    _die("unmount requires either --path or --shortcut")
+
+
+def _cmd_unmount_all(defaults: Defaults, args: argparse.Namespace) -> None:
+    mounts = _list_fuse_sshfs_mounts()
+    if not args.all:
+        mounts = _filter_mounts_under_root(mounts, defaults.mount_root)
+
+    for m in mounts:
+        _unmount_path(Path(m["TARGET"]), defaults.mount_root)
+
+
+def _cmd_debug_config(config_path: Path, defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
+    info: Dict[str, Any] = {
+        "config_path": str(config_path),
+        "mount_root": str(defaults.mount_root),
+        "default_subnet": defaults.default_subnet,
+        "shortcuts": {
+            name: {
+                "remote": s.remote,
+                "mount_dir": s.mount_dir,
+                "port": s.port,
+                "identity": s.identity,
+                "options": list(s.options or []),
+                "readonly": s.readonly,
+                "no_reconnect_defaults": s.no_reconnect_defaults,
+            }
+            for name, s in shortcuts.items()
+        },
+        "mounts_under_root": _filter_mounts_under_root(_list_fuse_sshfs_mounts(), defaults.mount_root),
+        "mounts_all": _list_fuse_sshfs_mounts(),
+    }
+
+    print(json.dumps(info, indent=2, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    examples = f"""Examples:
+  # Create a shortcut
+  {APP_NAME} create-shortcut phone --remote user@192.0.2.10:/path
+
+  # Mount by shortcut name
+  {APP_NAME} mount phone
+
+  # Override the last IPv4 octet using config.default_subnet (e.g. 192.0.2 -> 192.0.2.138)
+  {APP_NAME} mount phone 138
+
+  # Mount by remote and save as a shortcut (overwrites existing shortcut name)
+  {APP_NAME} mount --remote user@192.0.2.10:/path --port 2200 --create-shortcut phone
+
+  # sshfs options vs SSH options:
+  #   sshfs options are passed as -o <value> (e.g. allow_other)
+  {APP_NAME} mount phone -o allow_other
+
+  #   SSH options must be passed via ssh_command
+  {APP_NAME} mount phone -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
+
+  # List mounts under mount_root
+  {APP_NAME} list-mounts
+
+  # Unmount everything under mount_root (safe default)
+  {APP_NAME} unmount-all
+
+  # Unmount ALL sshfs mounts on the system (ignores mount_root; use with care)
+  {APP_NAME} unmount-all --all
+
+Config:
+  {DEFAULT_CONFIG_PATH}
+"""
+
+    parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Manage sshfs mounts under a configurable mount root (default /mnt/sshfs).",
-        epilog=HELP_EXAMPLES,
+        description="CLI utility for managing sshfs mounts.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=examples,
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
 
-    # mount
-    pm = sub.add_parser("mount", help="Mount an sshfs target")
-    pm.add_argument("--remote", help="Remote in form user@host:/path")
-    pm.add_argument("--shortcut", help="Shortcut name from config.")
-    pm.add_argument("id", nargs="?", help="Optional ID override (e.g., last IPv4 octet). Used with --shortcut.")
-    pm.add_argument("--create-shortcut", metavar="NAME", help="Create/overwrite shortcut NAME. Sets shortcut id=NAME and saves invocation.")
-    pm.add_argument("--mount-dir", metavar="DIR", help="Mount directory name under mount_root.")
-    pm.add_argument("-p", "--port", type=int, help="SSH port (passed to sshfs -p). Saved into shortcut when creating.")
-    pm.add_argument("-i", "--identity", metavar="PATH", help="SSH identity file. Saved into shortcut when creating.")
-    pm.add_argument("--readonly", action="store_true", help="Mount read-only. Saved into shortcut when creating.")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.toml (default: %(default)s)",
+    )
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    pm = sub.add_parser(
+        "mount",
+        help="Mount a shortcut or a remote via sshfs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(f"""\
+        Examples:
+          {APP_NAME} mount phone
+          {APP_NAME} mount phone 138
+          {APP_NAME} mount --remote user@192.0.2.10:/path --port 2200 --create-shortcut phone
+          {APP_NAME} mount phone -o allow_other
+          {APP_NAME} mount phone -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
+        """),
+    )
+    pm.add_argument("shortcut_name", nargs="?", help="Shortcut name (positional form).")
+    pm.add_argument("octet", nargs="?", help="Optional last IPv4 octet override (requires config.default_subnet).")
+
+    pm.add_argument("--remote", help="Remote in the form user@host:/path (bypasses shortcuts).")
+    pm.add_argument("--mount-dir", help="Directory name under mount_root (defaults to remote path leaf).")
+    pm.add_argument("-p", "--port", type=int, help="SSH port.")
+    pm.add_argument("-i", "--identity", help="SSH identity file path.")
     pm.add_argument(
         "-o",
         "--option",
         dest="options",
         action="append",
         default=[],
-        help="Extra sshfs -o option (repeatable; comma-delimited ok). Saved into shortcut when creating.",
+        help="sshfs -o option value. For SSH options, use -o \"ssh_command=ssh <ssh-options>\".",
     )
-    pm.add_argument(
-        "--no-reconnect-defaults",
-        action="store_true",
-        help="Disable default reconnect/keepalive sshfs options. Saved into shortcut when creating.",
-    )
-    pm.set_defaults(func=cmd_mount)
+    pm.add_argument("--readonly", action="store_true", help="Mount read-only (ro).")
+    pm.add_argument("--no-reconnect-defaults", action="store_true", help="Disable default reconnect/ServerAlive options.")
+    pm.add_argument("--create-shortcut", metavar="NAME", help="Create/overwrite shortcut NAME from this mount.")
+    pm.add_argument("--shortcut", metavar="NAME", help="Shortcut name (legacy flag form; prefer positional).")
 
-    # unmount
-    pu = sub.add_parser("unmount", help="Unmount an sshfs mount")
-    pu.add_argument("--path", help="Mountpoint path to unmount (must be under mount_root).")
-    pu.add_argument("--shortcut", help="Shortcut name to unmount (maps to its mount_dir under mount_root).")
-    pu.set_defaults(func=cmd_unmount)
-
-    # unmount-all
-    pua = sub.add_parser("unmount-all", help="Unmount all sshfs mounts under mount_root (safe default)")
-    pua.add_argument("--all", action="store_true", help="Also unmount ALL fuse.sshfs mounts on the system (dangerous; ignores mount_root).")
-    pua.set_defaults(func=cmd_unmount_all)
-
-    # status
-    ps = sub.add_parser("status", help="Show mount status")
-    ps.add_argument("--path", help="Check status of a mountpoint path (under mount_root).")
-    ps.add_argument("--shortcut", help="Check status of a shortcut name.")
-    ps.add_argument("--json", action="store_true", help="Emit JSON (when listing all shortcuts).")
-    ps.set_defaults(func=cmd_status)
-
-    # list-mounts (hard break: list-mounted removed)
-    plm = sub.add_parser("list-mounts", help="List sshfs mounts under mount_root")
-    plm.add_argument("--all", action="store_true", help="Show all system fuse.sshfs mounts, not just those under mount_root.")
+    plm = sub.add_parser("list-mounts", help="List current fuse.sshfs mounts (scoped to mount_root by default).")
+    plm.add_argument("--all", action="store_true", help="List all fuse.sshfs mounts on the system.")
     plm.add_argument("--json", action="store_true", help="Emit JSON.")
-    plm.set_defaults(func=cmd_list_mounts)
 
-    # list-shortcuts
-    pls = sub.add_parser("list-shortcuts", help="List configured shortcuts")
+    pu = sub.add_parser("unmount", help="Unmount a single sshfs mount under mount_root.")
+    pu.add_argument("--path", help="Mount path to unmount.")
+    pu.add_argument("--shortcut", help="Shortcut name to unmount.")
+
+    pua = sub.add_parser("unmount-all", help="Unmount all sshfs mounts under mount_root (safe default).")
+    pua.add_argument("--all", action="store_true", help="Also unmount ALL fuse.sshfs mounts on the system (dangerous; ignores mount_root).")
+
+    ps = sub.add_parser("status", help="Show mount status for shortcuts or a path.")
+    ps.add_argument("--shortcut", help="Shortcut name to check.")
+    ps.add_argument("--path", help="Path to check.")
+
+    pls = sub.add_parser("list-shortcuts", help="List configured shortcuts.")
     pls.add_argument("--json", action="store_true", help="Emit JSON.")
-    pls.set_defaults(func=cmd_list_shortcuts)
 
-    # create-shortcut
-    pcs = sub.add_parser("create-shortcut", help="Create or update a shortcut")
-    pcs.add_argument("name", help="Shortcut name")
-    pcs.add_argument("--remote", required=True, help="Remote in form user@host:/path")
-    pcs.add_argument("--id", help="Optional id field for the shortcut (defaults to NAME).")
-    pcs.add_argument("--mount-dir", metavar="DIR", help="Mount directory name under mount_root.")
-    pcs.add_argument("-p", "--port", type=int, help="Saved SSH port for this shortcut.")
-    pcs.add_argument("-i", "--identity", metavar="PATH", help="Saved identity file for this shortcut.")
-    pcs.add_argument("--readonly", action="store_true", help="Saved read-only flag for this shortcut.")
-    pcs.add_argument(
-        "-o",
-        "--option",
-        dest="options",
-        action="append",
-        default=[],
-        help="Saved sshfs -o option (repeatable; comma-delimited ok).",
-    )
-    pcs.add_argument(
-        "--no-reconnect-defaults",
-        action="store_true",
-        help="Saved flag: disable default reconnect/keepalive sshfs options.",
-    )
-    pcs.set_defaults(func=cmd_create_shortcut)
+    pcs = sub.add_parser("create-shortcut", help="Create or update a shortcut.")
+    pcs.add_argument("name", help="Shortcut name.")
+    pcs.add_argument("--remote", required=True, help="Remote in the form user@host:/path.")
+    pcs.add_argument("--mount-dir", help="Directory name under mount_root (defaults to remote path leaf).")
+    pcs.add_argument("-p", "--port", type=int, help="SSH port to save.")
+    pcs.add_argument("-i", "--identity", help="SSH identity file path to save.")
+    pcs.add_argument("-o", "--option", dest="options", action="append", default=[], help="sshfs -o option value.")
+    pcs.add_argument("--readonly", action="store_true", help="Save as read-only.")
+    pcs.add_argument("--no-reconnect-defaults", action="store_true", help="Save without reconnect defaults.")
 
-    # delete-shortcut
-    pds = sub.add_parser("delete-shortcut", help="Delete a shortcut")
-    pds.add_argument("name", help="Shortcut name")
-    pds.set_defaults(func=cmd_delete_shortcut)
+    pds = sub.add_parser("delete-shortcut", help="Delete a shortcut.")
+    pds.add_argument("name", help="Shortcut name.")
 
-    # set-default-subnet
-    psub = sub.add_parser("set-default-subnet", help="Set defaults.default_subnet (three octets)")
-    psub.add_argument("subnet", help="Three octets like 192.0.2")
-    psub.set_defaults(func=cmd_set_default_subnet)
+    psub = sub.add_parser("set-default-subnet", help="Set config.default_subnet (three octets) for numeric host overrides.")
+    psub.add_argument("subnet", help='Three octets like "192.0.2" (or empty string to clear).')
 
-    # debug-config
-    pdc = sub.add_parser("debug-config", help="Print resolved config and mount diagnostics")
-    pdc.set_defaults(func=cmd_debug_config)
+    pdc = sub.add_parser("debug-config", help="Print resolved config and mount diagnostics.")
+    pdc.add_argument("--json", action="store_true", help="Emit JSON.")
 
-    return p
+    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    try:
-        return int(args.func(args))
-    except KeyboardInterrupt:
-        return 130
-    except Exception as e:
-        msg = str(e).strip() or repr(e)
-        print(f"{APP_NAME}: {msg}", file=sys.stderr)
-        return 1
+    config_path = Path(args.config).expanduser()
+    defaults, shortcuts = _load_config(config_path)
+
+    if args.cmd == "list-mounts":
+        _cmd_list_mounts(defaults, args)
+    elif args.cmd == "list-shortcuts":
+        _cmd_list_shortcuts(shortcuts, args)
+    elif args.cmd == "create-shortcut":
+        _cmd_create_shortcut(config_path, defaults, shortcuts, args)
+    elif args.cmd == "delete-shortcut":
+        _cmd_delete_shortcut(config_path, defaults, shortcuts, args)
+    elif args.cmd == "set-default-subnet":
+        _cmd_set_default_subnet(config_path, defaults, shortcuts, args)
+    elif args.cmd == "mount":
+        _cmd_mount(config_path, defaults, shortcuts, args)
+    elif args.cmd == "unmount":
+        _cmd_unmount(defaults, shortcuts, args)
+    elif args.cmd == "unmount-all":
+        _cmd_unmount_all(defaults, args)
+    elif args.cmd == "status":
+        _cmd_status(defaults, shortcuts, args)
+    elif args.cmd == "debug-config":
+        _cmd_debug_config(config_path, defaults, shortcuts, args)
+    else:
+        _die(f"unknown command: {args.cmd}")
+
+    return 0
 
 
 if __name__ == "__main__":
