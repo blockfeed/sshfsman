@@ -8,7 +8,7 @@ It is intended for workflows where the same remote filesystems are mounted frequ
 
 ## Motivation
 
-I use `sftpman` regularly for interactive file access. In practice, there are times when a full filesystem mount is the better tool, for example when copying or syncing larger sets of files.
+I like `sftpman`, but my needs are different here: I wanted a CLI that could manage filesystem mounts explicitly and tolerate hosts whose addresses change over time.
 
 A common case is mounting storage exposed by a mobile device. Because modern devices often use randomized MAC addresses, the IP address can change between connections. Hard-coded mounts or shell aliases tend to break when that happens.
 
