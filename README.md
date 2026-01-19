@@ -1,297 +1,124 @@
 # sshfsman
 
-`sshfsman` is a small CLI I use to manage `sshfs` mounts without thinking about them too hard.
+sshfsman is a command-line utility for managing sshfs mounts.
 
-It exists because I mount the same few remote filesystems over and over, sometimes on non-default ports, sometimes with a pile of options, and I got tired of retyping commands or guessing why a reconnect failed. This tool makes those mounts repeatable, predictable, and easy to clean up.
-
-It is intentionally boring software.
+It is designed for workflows that require repeatable mounts and explicit handling of connection parameters that may change over time.
 
 ---
 
-## What it does
+## SYNOPSIS
 
-- Manages `sshfs` mounts under a single mount root (default: `/mnt/sshfs`)
-- Lets you define **shortcuts** for common remotes
-- Saves the full mount invocation with the shortcut (port, options, identity, etc.)
-- Reuses that invocation automatically on future mounts
-- Provides clean unmounting and safe cleanup
-- Never guesses whether something is mounted
+    sshfsman <command> [options]
 
 ---
 
-## Requirements
+## DESCRIPTION
+
+sshfsman manages sshfs mounts under a single mount root (default: /mnt/sshfs) and provides a shortcut mechanism for recreating mounts in a consistent way.
+
+It is intended for environments where:
+
+- The same remote filesystems are mounted repeatedly
+- Host addressing is not static
+- Mount behavior must be explicit and reproducible
+- Cleanup must be safe and predictable
+
+---
+
+## REQUIREMENTS
 
 - Linux
-- `sshfs` and `fuse3`
-- `findmnt` (from util-linux)
+- sshfs
+- fuse3
+- findmnt (util-linux)
 
 ---
 
-## Installation
+## INSTALLATION
 
-### With pipx (recommended)
+### Using pipx
 
-```bash
-pipx install .
-```
+    pipx install .
 
-or from a cloned repo:
+From a local checkout:
 
-```bash
-pipx install --editable .
-```
-
-### With a virtualenv
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -e .
-```
-
-You can also run it directly via the wrapper:
-
-```bash
-./sshfsman.py --help
-```
+    pipx install --editable .
 
 ---
 
-## Configuration
+## CONFIGURATION
 
-Config lives at:
+Configuration is read from:
 
-```
-~/.config/sshfsman/config.toml
-```
+    ~/.config/sshfsman/config.toml
 
 Example:
 
-```toml
-[config]
-mount_root = "/mnt/sshfs"
-default_subnet = "192.0.2"
+    [config]
+    mount_root = "/mnt/sshfs"
+    default_subnet = "192.0.2"
 
-[shortcuts]
+    [shortcuts]
 
-[shortcuts."android"]
-id = "android"
-remote = "user@192.0.2.10:/path"
-mount_dir = "SDCard"
-
-# Saved mount invocation (optional)
-port = 2200
-identity = "/home/user/.ssh/id_ed25519"
-options = [
-  "allow_other",
-]
-readonly = false
-no_reconnect_defaults = false
-```
-
-### Notes
-
-- `mount_root` is where all mounts live
-- `default_subnet` is optional and only used when you override an ID on a shortcut
-- Everything under a shortcut is optional except `remote`
+    [shortcuts."phone"]
+    remote = "user@192.0.2.10:/path"
+    mount_dir = "SDCard"
 
 ---
 
-## Shortcuts save how you mounted things
+## SHORTCUTS
 
-When you create a shortcut using either:
+A shortcut defines how a remote filesystem should be mounted.
 
-```bash
-sshfsman mount --create-shortcut android --remote user@192.0.2.10:/path
-```
+Create or update a shortcut:
 
-or:
+    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
 
-```bash
-sshfsman create-shortcut android --remote user@192.0.2.10:/path
-```
+Mount a shortcut:
 
-`sshfsman` saves **how** you mounted it, not just where:
-
-- SSH port
-- Identity file
-- sshfs `-o` options
-- Read-only flag
-- Reconnect behavior
-
-Later, when you run:
-
-```bash
-sshfsman mount --shortcut android
-```
-
-you get the *same mount* again, without retyping anything.
-
-This is the entire point of the tool.
+    sshfsman mount phone
 
 ---
 
-## Commands
+## SUBNET-BASED HOST OVERRIDES
 
-### mount
+When mounting a shortcut, a numeric argument may be provided:
 
-Mount a remote and create or overwrite a shortcut:
+    sshfsman mount phone 138
 
-```bash
-sshfsman mount \
-  --remote user@192.0.2.10:/path \
-  --port 2200 \
-  --create-shortcut android
-```
-
-Mount using an existing shortcut:
-
-```bash
-sshfsman mount --shortcut android
-```
-
-Override the last octet when applicable:
-
-```bash
-sshfsman mount --shortcut android 138
-```
-
-Notes:
-
-- Existing directories do **not** block mounting
-- Only an actual sshfs mount blocks remounting
+If default_subnet is set, the numeric value is treated as the final IPv4 octet and combined with the configured subnet.
 
 ---
 
-### list-mounts
+## SSHFS OPTIONS VS SSH OPTIONS
 
-List current sshfs mounts under the mount root:
+sshfs options affect filesystem behavior and are passed directly:
 
-```bash
-sshfsman list-mounts
-```
+    sshfsman mount phone -o allow_other
 
-List all sshfs mounts on the system:
+SSH client options must be passed via ssh_command:
 
-```bash
-sshfsman list-mounts --all
-```
+    sshfsman mount phone \
+      -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
 
 ---
 
-### unmount
+## COMMANDS
 
-Unmount by shortcut:
+- mount
+- list-mounts
+- unmount
+- unmount-all
+- list-shortcuts
+- create-shortcut
+- delete-shortcut
+- set-default-subnet
+- debug-config
 
-```bash
-sshfsman unmount --shortcut android
-```
-
-Or by path:
-
-```bash
-sshfsman unmount --path /mnt/sshfs/SDCard
-```
-
-Cleanup rules:
-
-- Only empty directories are removed
-- Only under `mount_root`
-- Nothing recursive, nothing destructive
+Each command provides usage information via --help.
 
 ---
 
-### unmount-all
-
-Unmount everything under the mount root:
-
-```bash
-sshfsman unmount-all
-```
-
-Include mounts outside the root:
-
-```bash
-sshfsman unmount-all --all
-```
-
----
-
-### status
-
-Check one shortcut:
-
-```bash
-sshfsman status --shortcut android
-```
-
-List status for all shortcuts:
-
-```bash
-sshfsman status
-```
-
----
-
-### list-shortcuts
-
-```bash
-sshfsman list-shortcuts
-sshfsman list-shortcuts --json
-```
-
----
-
-### create-shortcut
-
-Create or update a shortcut explicitly:
-
-```bash
-sshfsman create-shortcut \
-  android \
-  --remote user@192.0.2.10:/path \
-  --port 2200 \
-  -o allow_other
-```
-
----
-
-### delete-shortcut
-
-```bash
-sshfsman delete-shortcut android
-```
-
----
-
-### set-default-subnet
-
-```bash
-sshfsman set-default-subnet 192.0.2
-```
-
----
-
-### debug-config
-
-Dump resolved config and current mounts:
-
-```bash
-sshfsman debug-config
-```
-
-This is mostly here for when something feels off and you want to see exactly what the tool thinks.
-
----
-
-## Why this exists
-
-I like `sshfs`. I just don’t like babysitting it.
-
-`sshfsman` exists to make mounts repeatable, obvious, and disposable. It does not try to be clever, magical, or universal. It just does the same thing every time and gets out of the way.
-
----
-
-## License
+## LICENSE
 
 GPL-3.0-only
