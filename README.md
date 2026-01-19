@@ -2,41 +2,50 @@
 
 sshfsman is a command-line utility for managing sshfs mounts.
 
-It is designed for workflows that require repeatable mounts and explicit handling of connection parameters that may change over time.
+It is intended for workflows where remote filesystems are mounted repeatedly, connection parameters may change over time, and mounts must be created and removed in a predictable way.
 
 ---
 
-## SYNOPSIS
+## Usage
 
     sshfsman <command> [options]
 
----
-
-## DESCRIPTION
-
-sshfsman manages sshfs mounts under a single mount root (default: /mnt/sshfs) and provides a shortcut mechanism for recreating mounts in a consistent way.
-
-It is intended for environments where:
-
-- The same remote filesystems are mounted repeatedly
-- Host addressing is not static
-- Mount behavior must be explicit and reproducible
-- Cleanup must be safe and predictable
+Run any command with `--help` to see detailed usage and examples.
 
 ---
 
-## REQUIREMENTS
+## Common commands
 
-- Linux
-- sshfs
-- fuse3
-- findmnt (util-linux)
+Mount a configured shortcut:
+
+    sshfsman mount phone
+
+Mount the same shortcut using a different address within the configured subnet:
+
+    sshfsman mount phone 138
+
+Create or update a shortcut:
+
+    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
+
+Unmount all sshfs mounts under the configured mount root:
+
+    sshfsman unmount-all
 
 ---
 
-## INSTALLATION
+## Description
 
-### Using pipx
+sshfsman manages sshfs mounts under a single mount root (default: /mnt/sshfs).  
+Shortcut definitions allow the exact sshfs invocation to be stored and reused.
+
+The tool is designed to avoid implicit behavior. All mounts are created explicitly, detected reliably, and removed safely.
+
+---
+
+## Installation
+
+sshfsman is typically installed using pipx.
 
     pipx install .
 
@@ -46,13 +55,13 @@ From a local checkout:
 
 ---
 
-## CONFIGURATION
+## Configuration
 
 Configuration is read from:
 
     ~/.config/sshfsman/config.toml
 
-Example:
+Example configuration:
 
     [config]
     mount_root = "/mnt/sshfs"
@@ -66,11 +75,20 @@ Example:
 
 ---
 
-## SHORTCUTS
+## Shortcuts
 
 A shortcut defines how a remote filesystem should be mounted.
 
-Create or update a shortcut:
+Shortcuts may include:
+- remote path
+- SSH port
+- identity file
+- sshfs options
+- reconnect behavior
+
+Command-line options override stored values.
+
+Create or replace a shortcut:
 
     sshfsman create-shortcut phone --remote user@192.0.2.10:/path
 
@@ -80,45 +98,69 @@ Mount a shortcut:
 
 ---
 
-## SUBNET-BASED HOST OVERRIDES
+## Subnet-based address override
 
-When mounting a shortcut, a numeric argument may be provided:
+When mounting a shortcut, an optional numeric argument may be provided:
 
     sshfsman mount phone 138
 
-If default_subnet is set, the numeric value is treated as the final IPv4 octet and combined with the configured subnet.
+If `default_subnet` is configured, the numeric value is treated as the final IPv4 octet and combined with that subnet.
+
+This is intended for hosts that are frequently readdressed within the same network.
 
 ---
 
-## SSHFS OPTIONS VS SSH OPTIONS
+## sshfs options and SSH options
+
+sshfs options and SSH client options are separate.
 
 sshfs options affect filesystem behavior and are passed directly:
 
     sshfsman mount phone -o allow_other
 
-SSH client options must be passed via ssh_command:
+SSH client options must be passed via `ssh_command`:
 
     sshfsman mount phone \
       -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
 
----
-
-## COMMANDS
-
-- mount
-- list-mounts
-- unmount
-- unmount-all
-- list-shortcuts
-- create-shortcut
-- delete-shortcut
-- set-default-subnet
-- debug-config
-
-Each command provides usage information via --help.
+Passing raw SSH options directly to sshfs will result in an error.
 
 ---
 
-## LICENSE
+## Listing mounts
+
+List sshfs mounts under the configured mount root:
+
+    sshfsman list-mounts
+
+List all sshfs mounts on the system:
+
+    sshfsman list-mounts --all
+
+---
+
+## Unmounting
+
+Unmount all sshfs mounts under the configured mount root:
+
+    sshfsman unmount-all
+
+Unmount all sshfs mounts on the system:
+
+    sshfsman unmount-all --all
+
+The `--all` flag ignores the configured mount root and should be used with care.
+
+---
+
+## Help
+
+All commands provide usage information and examples via `--help`.
+
+The `--help` output is intended to be sufficient documentation for pipx-installed usage.
+
+---
+
+## License
 
 GPL-3.0-only
