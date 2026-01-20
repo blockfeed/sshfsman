@@ -10,36 +10,7 @@ It is intended for workflows where remote filesystems are mounted repeatedly, co
 
     sshfsman <command> [options]
 
-Run any command with `--help` to see detailed usage and examples.
-
----
-
-## Common commands
-
-Mount a configured shortcut:
-
-    sshfsman mount phone
-
-Mount the same shortcut using a different address within the configured subnet:
-
-    sshfsman mount phone 138
-
-Create or update a shortcut:
-
-    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
-
-Unmount all sshfs mounts under the configured mount root:
-
-    sshfsman unmount-all
-
----
-
-## Description
-
-sshfsman manages sshfs mounts under a single mount root (default: /mnt/sshfs).  
-Shortcut definitions allow the exact sshfs invocation to be stored and reused.
-
-The tool is designed to avoid implicit behavior. All mounts are created explicitly, detected reliably, and removed safely.
+Run any command with `--help` for detailed usage and examples.
 
 ---
 
@@ -61,73 +32,42 @@ Configuration is read from:
 
     ~/.config/sshfsman/config.toml
 
-Example configuration:
+Example:
 
     [config]
     mount_root = "/mnt/sshfs"
     default_subnet = "192.0.2"
 
     [shortcuts]
-
     [shortcuts."phone"]
     remote = "user@192.0.2.10:/path"
-    mount_dir = "SDCard"
+    mount_dir = "phone"
 
 ---
 
-## Shortcuts
+## Commands
 
-A shortcut defines how a remote filesystem should be mounted.
+### mount
 
-Shortcuts may include:
-- remote path
-- SSH port
-- identity file
-- sshfs options
-- reconnect behavior
-
-Command-line options override stored values.
-
-Create or replace a shortcut:
-
-    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
-
-Mount a shortcut:
+Mount a configured shortcut:
 
     sshfsman mount phone
 
----
-
-## Subnet-based address override
-
-When mounting a shortcut, an optional numeric argument may be provided:
+Mount using a subnet-based address override:
 
     sshfsman mount phone 138
 
-If `default_subnet` is configured, the numeric value is treated as the final IPv4 octet and combined with that subnet.
+The numeric argument is treated as the last IPv4 octet and combined with `default_subnet`.
 
-This is intended for hosts that are frequently readdressed within the same network.
+Mount directly from a remote and save as a shortcut:
 
----
+    sshfsman mount --remote user@192.0.2.10:/path --create-shortcut phone
 
-## sshfs options and SSH options
-
-sshfs options and SSH client options are separate.
-
-sshfs options affect filesystem behavior and are passed directly:
-
-    sshfsman mount phone -o allow_other
-
-SSH client options must be passed via `ssh_command`:
-
-    sshfsman mount phone \
-      -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
-
-Passing raw SSH options directly to sshfs will result in an error.
+When creating a shortcut during a remote mount, the mount directory defaults to the shortcut name unless `--mount-dir` is provided.
 
 ---
 
-## Listing mounts
+### list-mounts
 
 List sshfs mounts under the configured mount root:
 
@@ -139,7 +79,16 @@ List all sshfs mounts on the system:
 
 ---
 
-## Unmounting
+### unmount
+
+Unmount a single shortcut or mount path:
+
+    sshfsman unmount phone
+    sshfsman unmount /mnt/sshfs/phone
+
+---
+
+### unmount-all
 
 Unmount all sshfs mounts under the configured mount root:
 
@@ -149,15 +98,71 @@ Unmount all sshfs mounts on the system:
 
     sshfsman unmount-all --all
 
-The `--all` flag ignores the configured mount root and should be used with care.
+The `--all` flag ignores `mount_root` and should be used deliberately.
 
 ---
 
-## Help
+### status
 
-All commands provide usage information and examples via `--help`.
+Show sshfs mount status:
 
-The `--help` output is intended to be sufficient documentation for pipx-installed usage.
+    sshfsman status
+    sshfsman status phone
+
+---
+
+### list-shortcuts
+
+List configured shortcuts:
+
+    sshfsman list-shortcuts
+
+---
+
+### create-shortcut
+
+Create or update a shortcut:
+
+    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
+
+---
+
+### delete-shortcut
+
+Delete a shortcut:
+
+    sshfsman delete-shortcut phone
+
+---
+
+### set-default-subnet
+
+Set the default subnet used for positional mount overrides:
+
+    sshfsman set-default-subnet 192.0.2
+
+---
+
+### debug-config
+
+Print the resolved configuration and shortcuts:
+
+    sshfsman debug-config
+
+---
+
+## sshfs options vs SSH options
+
+sshfs options affect filesystem behavior and are passed directly:
+
+    sshfsman mount phone -o allow_other
+
+SSH client options must be passed via `ssh_command`:
+
+    sshfsman mount phone \
+      -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
+
+Passing raw SSH options directly to sshfs will result in an error.
 
 ---
 
