@@ -463,22 +463,48 @@ def _cmd_mount(
 ) -> None:
     if args.remote:
         remote = args.remote.strip()
+
+        # Mount directory selection (remote mounts):
+        # - If --mount-dir is provided, use it.
+        # - If --create-shortcut NAME is provided, default mount_dir to NAME (prevents collisions).
+        # - Otherwise, derive from the remote path leaf.
+        if args.mount_dir:
+            mount_dir_used = args.mount_dir
+        elif args.create_shortcut:
+            mount_dir_used = args.create_shortcut
+        else:
+            mount_dir_used = None  # _mount will derive from remote path leaf
+
         target = _mount(
             defaults,
             remote=remote,
-            mount_dir=args.mount_dir,
+            mount_dir=mount_dir_used,
             port=args.port,
             identity=args.identity,
             options=list(args.options or []),
             readonly=bool(args.readonly),
             no_reconnect_defaults=bool(args.no_reconnect_defaults),
         )
+
         if args.create_shortcut:
             name = args.create_shortcut
+
+            # Prevent two different shortcuts from silently sharing the same mount_dir.
+            # Use --mount-dir to select a different target directory when needed.
+            if mount_dir_used:
+                for other_name, other_sc in shortcuts.items():
+                    if other_name == name:
+                        continue
+                    if other_sc.mount_dir == mount_dir_used:
+                        _die(
+                            f"mount_dir {mount_dir_used!r} already used by shortcut {other_name!r}; "
+                            "choose --mount-dir or a different shortcut name"
+                        )
+
             shortcuts[name] = Shortcut(
                 name=name,
                 remote=remote,
-                mount_dir=args.mount_dir or target.name,
+                mount_dir=mount_dir_used or target.name,
                 port=args.port,
                 identity=args.identity,
                 options=list(args.options or []),
@@ -486,6 +512,7 @@ def _cmd_mount(
                 no_reconnect_defaults=bool(args.no_reconnect_defaults),
             )
             _write_config(config_path, defaults, shortcuts)
+
         print(str(target))
         return
 
