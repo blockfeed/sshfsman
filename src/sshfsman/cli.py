@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import subprocess
+import shutil
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,19 @@ def _run(cmd: List[str], *, check: bool = False, capture: bool = False) -> subpr
         )
     except FileNotFoundError:
         _die(f"missing dependency: {cmd[0]!r} not found in PATH")
+
+
+def _require_deps() -> None:
+    """Fail fast with clear messages if core deps are missing.
+
+    Note: this runs after argparse parsing so `sshfsman --help` works even if deps are missing.
+    """
+    for cmd in ("findmnt", "sshfs"):
+        if shutil.which(cmd) is None:
+            _die(f"missing dependency: {cmd!r} not found in PATH")
+
+    if shutil.which("fusermount3") is None and shutil.which("fusermount") is None:
+        _die("missing dependency: 'fusermount3' or 'fusermount' not found in PATH")
 
 
 def _load_config(config_path: Path) -> Tuple[Defaults, Dict[str, Shortcut]]:
@@ -233,6 +247,34 @@ def _safe_rmdir_empty_under_root(path: Path, mount_root: Path) -> None:
         return
 
 
+def _prune_empty_dirs_under_root(mount_root: Path) -> None:
+    """Remove empty directories under mount_root (bottom-up), skipping mounted paths."""
+    try:
+        mount_root = mount_root.resolve()
+    except Exception:
+        return
+
+    for root, dirs, _files in os.walk(mount_root, topdown=False):
+        for d in dirs:
+            p = Path(root) / d
+            try:
+                rp = p.resolve()
+            except Exception:
+                continue
+
+            if rp == mount_root:
+                continue
+            if not str(rp).startswith(str(mount_root).rstrip("/") + "/"):
+                continue
+            if is_sshfs_mounted(rp):
+                continue
+
+            try:
+                rp.rmdir()  # only removes if empty
+            except OSError:
+                pass
+
+
 def _resolve_host_with_optional_octet(remote: str, default_subnet: str, octet: Optional[str]) -> str:
     if octet is None:
         return remote
@@ -349,11 +391,30 @@ def _unmount_path(path: Path, mount_root: Path) -> None:
     _safe_rmdir_empty_under_root(path, mount_root)
 
 
-def _cmd_list_mounts(defaults: Defaults, args: argparse.Namespace) -> None:
+def _cmd_list_mounts(defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
     mounts = _list_fuse_sshfs_mounts()
     if not args.all:
         mounts = _filter_mounts_under_root(mounts, defaults.mount_root)
 
+    if args.json:
+        # Keep JSON output stable (no shortcut decoration) unless the caller wants to post-process.
+        print(json.dumps(mounts, indent=2, sort_keys=True))
+        return
+
+    # Build reverse lookup: mount TARGET -> shortcut name(s)
+    target_to_names: Dict[str, List[str]] = {}
+    for name in sorted(shortcuts.keys()):
+        s = shortcuts[name]
+        target = (defaults.mount_root / (s.mount_dir or _default_mount_dir_from_remote(s.remote))).resolve()
+        target_to_names.setdefault(str(target), []).append(name)
+
+    # Human output: add headers so it's obvious what each column is.
+    print("SHORTCUT\tSOURCE\tTARGET")
+    for mnt in mounts:
+        tgt = mnt.get("TARGET", "")
+        names = target_to_names.get(tgt, [])
+        sc = ",".join(names) if names else "-"
+        print(f"{sc}\t{mnt.get('SOURCE','')}\t{tgt}")
     if args.json:
         print(json.dumps(mounts, indent=2, sort_keys=True))
         return
@@ -556,15 +617,16 @@ def _cmd_unmount(defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argpa
         _unmount_path(Path(args.path), mount_root)
         return
 
-    if args.shortcut:
-        s = shortcuts.get(args.shortcut)
+    name = args.shortcut or getattr(args, 'name', None)
+    if name:
+        s = shortcuts.get(name)
         if not s:
-            _die(f"unknown shortcut: {args.shortcut}")
+            _die(f"unknown shortcut: {name}")
         target = mount_root / (s.mount_dir or _default_mount_dir_from_remote(s.remote))
         _unmount_path(target, mount_root)
         return
 
-    _die("unmount requires either --path or --shortcut")
+    _die("unmount requires either --path or --shortcut (or positional shortcut name)")
 
 
 def _cmd_unmount_all(defaults: Defaults, args: argparse.Namespace) -> None:
@@ -574,6 +636,8 @@ def _cmd_unmount_all(defaults: Defaults, args: argparse.Namespace) -> None:
 
     for m in mounts:
         _unmount_path(Path(m["TARGET"]), defaults.mount_root)
+
+    _prune_empty_dirs_under_root(defaults.mount_root)
 
 
 def _cmd_debug_config(config_path: Path, defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
@@ -687,6 +751,7 @@ Config:
     plm.add_argument("--json", action="store_true", help="Emit JSON.")
 
     pu = sub.add_parser("unmount", help="Unmount a single sshfs mount under mount_root.")
+    pu.add_argument("name", nargs="?", help="Shortcut name (positional form).")
     pu.add_argument("--path", help="Mount path to unmount.")
     pu.add_argument("--shortcut", help="Shortcut name to unmount.")
 
@@ -726,11 +791,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    _require_deps()
+
     config_path = Path(args.config).expanduser()
     defaults, shortcuts = _load_config(config_path)
 
     if args.cmd == "list-mounts":
-        _cmd_list_mounts(defaults, args)
+        _cmd_list_mounts(defaults, shortcuts, args)
     elif args.cmd == "list-shortcuts":
         _cmd_list_shortcuts(shortcuts, args)
     elif args.cmd == "create-shortcut":
@@ -757,3 +824,37 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# --- PATCH: enhanced list-mounts with shortcut names + headers ---
+
+def _cmd_list_mounts(defaults: Defaults, shortcuts: Dict[str, Shortcut], args: argparse.Namespace) -> None:
+    mounts = _list_fuse_sshfs_mounts()
+    if not args.all:
+        mounts = _filter_mounts_under_root(mounts, defaults.mount_root)
+
+    # Build reverse lookup: mount_path -> shortcut name
+    path_to_shortcut = {}
+    for name, s in shortcuts.items():
+        target = defaults.mount_root / (s.mount_dir or Path(s.remote.split(":",1)[1]).name)
+        path_to_shortcut[str(target)] = name
+
+    rows = []
+    for m in mounts:
+        target = m["TARGET"]
+        rows.append({
+            "shortcut": path_to_shortcut.get(target, "-"),
+            "source": m["SOURCE"],
+            "target": target,
+        })
+
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+
+    # Print headers
+    print(f"{'SHORTCUT':<24} {'SOURCE':<40} TARGET")
+    print(f"{'-'*24} {'-'*40} {'-'*20}")
+    for r in rows:
+        print(f"{r['shortcut']:<24} {r['source']:<40} {r['target']}")
+
+# --- END PATCH ---

@@ -1,47 +1,50 @@
 # sshfsman
 
-sshfsman is a command-line utility for managing sshfs mounts.
+`sshfsman` is a small, CLI-first utility for managing `sshfs` mounts in a deterministic and scriptable way.
 
-It is intended for workflows where remote filesystems are mounted repeatedly, connection parameters may change over time, and mounts must be created and removed in a predictable way.
-
----
-
-## Usage
-
-    sshfsman <command> [options]
-
-Run any command with `--help` for detailed usage and examples.
+It exists to remove guesswork around sshfs state, make mounts repeatable, and avoid the usual pile of half-mounted directories and stale mountpoints.
 
 ---
 
-## Installation
+## Key Principles
 
-sshfsman is typically installed using pipx.
+- Deterministic mount detection using `findmnt`
+- Scoped by default under a single mount root
+- No background state or daemons
+- Safe-by-default unmounting
 
-    pipx install .
+---
 
-From a local checkout:
+## Requirements
 
-    pipx install --editable .
+Commands required in PATH:
+
+- sshfs
+- findmnt (util-linux)
+- fusermount3 (preferred) or fusermount
 
 ---
 
 ## Configuration
 
-Configuration is read from:
+Default config path:
 
-    ~/.config/sshfsman/config.toml
+~/.config/sshfsman/config.toml
 
-Example:
+### Example (anonymized)
 
-    [config]
-    mount_root = "/mnt/sshfs"
-    default_subnet = "192.0.2"
+```toml
+[config]
+mount_root = "/mnt/sshfs"
+default_subnet = "192.0.2"
 
-    [shortcuts]
-    [shortcuts."phone"]
-    remote = "user@192.0.2.10:/path"
-    mount_dir = "phone"
+[shortcuts."example"]
+remote = "user@192.0.2.10:/home/user/project"
+mount_dir = "project"
+options = ["allow_other"]
+```
+
+All examples use documentation-only IP ranges and placeholder usernames.
 
 ---
 
@@ -49,123 +52,51 @@ Example:
 
 ### mount
 
-Mount a configured shortcut:
-
-    sshfsman mount phone
-
-Mount using a subnet-based address override:
-
-    sshfsman mount phone 138
-
-The numeric argument is treated as the last IPv4 octet and combined with `default_subnet`.
-
-Mount directly from a remote and save as a shortcut:
-
-    sshfsman mount --remote user@192.0.2.10:/path --create-shortcut phone
-
-When creating a shortcut during a remote mount, the mount directory defaults to the shortcut name unless `--mount-dir` is provided.
-
----
+```bash
+sshfsman mount <shortcut>
+sshfsman mount <shortcut> <octet>
+sshfsman mount --remote user@host:/path [options]
+```
 
 ### list-mounts
 
-List sshfs mounts under the configured mount root:
+```bash
+sshfsman list-mounts [--all] [--json]
+```
 
-    sshfsman list-mounts
+Human output:
 
-List all sshfs mounts on the system:
-
-    sshfsman list-mounts --all
-
----
+```
+SHORTCUT    SOURCE                           TARGET
+example     user@192.0.2.10:/home/...        /mnt/sshfs/project
+-           user@198.51.100.5:/srv/...       /mnt/sshfs/other
+```
 
 ### unmount
 
-Unmount a single shortcut or mount path:
-
-    sshfsman unmount phone
-    sshfsman unmount /mnt/sshfs/phone
-
----
+```bash
+sshfsman unmount <shortcut>
+sshfsman unmount --path /mnt/sshfs/<dir>
+```
 
 ### unmount-all
 
-Unmount all sshfs mounts under the configured mount root:
+```bash
+sshfsman unmount-all [--all]
+```
 
-    sshfsman unmount-all
-
-Unmount all sshfs mounts on the system:
-
-    sshfsman unmount-all --all
-
-The `--all` flag ignores `mount_root` and should be used deliberately.
+Empty directories under mount_root are pruned after unmounting.
 
 ---
 
-### status
+## Safety Notes
 
-Show sshfs mount status:
-
-    sshfsman status
-    sshfsman status phone
-
----
-
-### list-shortcuts
-
-List configured shortcuts:
-
-    sshfsman list-shortcuts
-
----
-
-### create-shortcut
-
-Create or update a shortcut:
-
-    sshfsman create-shortcut phone --remote user@192.0.2.10:/path
-
----
-
-### delete-shortcut
-
-Delete a shortcut:
-
-    sshfsman delete-shortcut phone
-
----
-
-### set-default-subnet
-
-Set the default subnet used for positional mount overrides:
-
-    sshfsman set-default-subnet 192.0.2
-
----
-
-### debug-config
-
-Print the resolved configuration and shortcuts:
-
-    sshfsman debug-config
-
----
-
-## sshfs options vs SSH options
-
-sshfs options affect filesystem behavior and are passed directly:
-
-    sshfsman mount phone -o allow_other
-
-SSH client options must be passed via `ssh_command`:
-
-    sshfsman mount phone \
-      -o "ssh_command=ssh -o KexAlgorithms=+diffie-hellman-group14-sha1"
-
-Passing raw SSH options directly to sshfs will result in an error.
+- sshfsman never modifies permissions or ownership
+- directories outside mount_root are never touched
+- users are responsible for reviewing output before sharing
 
 ---
 
 ## License
 
-GPL-3.0-only
+GPLv3
