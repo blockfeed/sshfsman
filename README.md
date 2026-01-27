@@ -93,7 +93,6 @@ Empty directories under mount_root are pruned after unmounting.
 
 - sshfsman never modifies permissions or ownership
 - directories outside mount_root are never touched
-- users are responsible for reviewing output before sharing
 
 ---
 
